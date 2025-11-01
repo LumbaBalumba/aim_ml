@@ -1,0 +1,8 @@
+4/train.csv filter=lfs diff=lfs merge=lfs -text
+4/submission.csv filter=lfs diff=lfs merge=lfs -text
+4/t1_webstat.csv filter=lfs diff=lfs merge=lfs -text
+4/test.csv filter=lfs diff=lfs merge=lfs -text
+3/description.csv filter=lfs diff=lfs merge=lfs -text
+2/titanic_train.csv filter=lfs diff=lfs merge=lfs -text
+2/winemag-data-noreview.csv filter=lfs diff=lfs merge=lfs -text
+3/application_train.csv filter=lfs diff=lfs merge=lfs -text
