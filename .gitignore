@@ -2,3 +2,4 @@
 **/__pycache__
 **/*.csv
 **/*.parquet
+7/expression_data.npz
