@@ -8,6 +8,10 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec, GridSpecFromSubplotSpec
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from pandas.api.types import is_float_dtype
+from ipywidgets import widgets
 
 from sklearn.base import clone, BaseEstimator, TransformerMixin
 from sklearn.metrics import (
@@ -43,7 +47,7 @@ class ScoreHistogramPlotResult:
 @dataclass
 class ScoreFeatureContourPlotResult:
     fitted_model: object
-    fig: plt.Figure
+    fig: object
     train_scores: np.ndarray
     val_scores: np.ndarray
     train_feature_values: np.ndarray
@@ -293,6 +297,166 @@ class BinaryClassifierInterpreter:
 
         raise TypeError("Unsupported model type for raw score extraction.")
 
+    @classmethod
+    def _get_feature_options(cls, X) -> list:
+        if hasattr(X, "columns"):
+            return list(X.columns)
+        X_arr = np.asarray(X)
+        if X_arr.ndim != 2:
+            raise ValueError(f"X must be 2D, got shape={X_arr.shape}")
+        return list(range(X_arr.shape[1]))
+
+    @staticmethod
+    def _get_float_feature_names(X) -> list:
+        if hasattr(X, "dtypes") and hasattr(X, "columns"):
+            float_cols = []
+            for col in X.columns:
+                if is_float_dtype(X[col]):
+                    float_cols.append(col)
+            return float_cols
+
+        X_arr = np.asarray(X)
+        if X_arr.ndim != 2:
+            raise ValueError(f"X must be 2D, got shape={X_arr.shape}")
+
+        if np.issubdtype(X_arr.dtype, np.floating):
+            return list(range(X_arr.shape[1]))
+
+        return []
+
+    @classmethod
+    def _extract_feature_column(cls, X, feature_name: Union[str, int]) -> np.ndarray:
+        if hasattr(X, "columns"):
+            if isinstance(feature_name, str):
+                if feature_name not in X.columns:
+                    raise KeyError(
+                        f"Feature '{feature_name}' not found in X.columns")
+                values = X[feature_name].to_numpy()
+                return cls._to_numpy_1d(values, f"feature '{feature_name}'").astype(float)
+            if isinstance(feature_name, int):
+                values = X.iloc[:, feature_name].to_numpy()
+                return cls._to_numpy_1d(values, f"feature index {feature_name}").astype(float)
+            raise TypeError(
+                "For DataFrame input feature_name must be str or int")
+
+        X_arr = np.asarray(X)
+        if X_arr.ndim != 2:
+            raise ValueError(f"X must be 2D, got shape={X_arr.shape}")
+        if not isinstance(feature_name, int):
+            raise TypeError(
+                "When X is not a DataFrame, feature_name must be an integer column index")
+        return cls._to_numpy_1d(X_arr[:, feature_name], f"feature index {feature_name}").astype(float)
+
+    @classmethod
+    def _extract_feature_values(cls, X, feature_name: Any) -> np.ndarray:
+        return cls._extract_feature_column(X, feature_name)
+
+    @classmethod
+    def _feature_visual_clip_mask(
+        cls,
+        values: np.ndarray,
+        *,
+        lower_q: float = 0.002,
+        upper_q: float = 0.998,
+        iqr_k: float = 3.0,
+    ) -> np.ndarray:
+        values = cls._to_numpy_1d(values, "values")
+        finite_mask = np.isfinite(values)
+        v = values[finite_mask]
+        if len(v) < 10:
+            return finite_mask
+
+        q_lo, q_hi = np.quantile(v, [lower_q, upper_q])
+        q1, q3 = np.percentile(v, [25, 75])
+        iqr = q3 - q1
+        if iqr > 0 and np.isfinite(iqr):
+            iqr_lo = q1 - iqr_k * iqr
+            iqr_hi = q3 + iqr_k * iqr
+        else:
+            iqr_lo, iqr_hi = q_lo, q_hi
+        lo = max(q_lo, iqr_lo)
+        hi = min(q_hi, iqr_hi)
+        return finite_mask & (values >= lo) & (values <= hi)
+
+    @classmethod
+    def _joint_visual_clip_mask(
+        cls,
+        scores: np.ndarray,
+        feature_values: np.ndarray,
+        *,
+        score_q: Tuple[float, float] = (0.002, 0.998),
+        feature_q: Tuple[float, float] = (0.002, 0.998),
+    ) -> np.ndarray:
+        scores = cls._to_numpy_1d(scores, "scores")
+        feature_values = cls._to_numpy_1d(feature_values, "feature_values")
+        finite_mask = np.isfinite(scores) & np.isfinite(feature_values)
+        s = scores[finite_mask]
+        f = feature_values[finite_mask]
+        if len(s) < 10:
+            return finite_mask
+        s_lo, s_hi = np.quantile(s, score_q)
+        f_lo, f_hi = np.quantile(f, feature_q)
+        return finite_mask & (scores >= s_lo) & (scores <= s_hi) & (feature_values >= f_lo) & (feature_values <= f_hi)
+
+    @classmethod
+    def _adaptive_2d_bin_counts(
+        cls,
+        x: np.ndarray,
+        y: np.ndarray,
+        *,
+        min_bins: int = 25,
+        max_bins: int = 80,
+    ) -> Tuple[int, int]:
+        x = cls._to_numpy_1d(x, "x")
+        y = cls._to_numpy_1d(y, "y")
+        n = max(len(x), 1)
+        base = int(np.sqrt(n) / 3.0)
+        base = int(np.clip(base, min_bins, max_bins))
+        x_unique = len(np.unique(np.round(x, 8)))
+        y_unique = len(np.unique(np.round(y, 8)))
+        x_bins = int(
+            np.clip(min(base, max(10, x_unique // 3)), min_bins, max_bins))
+        y_bins = int(
+            np.clip(min(base, max(10, y_unique // 3)), min_bins, max_bins))
+        return x_bins, y_bins
+
+    @classmethod
+    def _adaptive_feature_bins(
+        cls,
+        values: np.ndarray,
+        *,
+        min_bins: int = 15,
+        max_bins: int = 80,
+        min_bin_width: Optional[float] = None,
+    ) -> Tuple[int, np.ndarray]:
+        values = cls._to_numpy_1d(values, "values")
+        values = values[np.isfinite(values)]
+        if len(values) == 0:
+            return min_bins, np.linspace(-1.0, 1.0, min_bins + 1)
+
+        lo = float(np.min(values))
+        hi = float(np.max(values))
+        data_range = hi - lo
+        if data_range <= 0:
+            eps = 1e-6 if lo == 0 else abs(lo) * 1e-6
+            return min_bins, np.linspace(lo - eps, hi + eps, min_bins + 1)
+
+        n = len(values)
+        q1, q3 = np.percentile(values, [25, 75])
+        iqr = q3 - q1
+        if iqr > 0:
+            bin_width = 2.0 * iqr / np.cbrt(n)
+        else:
+            bin_width = data_range / max(np.sqrt(n), 1.0)
+        if not np.isfinite(bin_width) or bin_width <= 0:
+            bin_width = data_range / max(np.sqrt(n), 1.0)
+        if min_bin_width is not None:
+            bin_width = max(bin_width, float(min_bin_width))
+        n_bins = int(np.ceil(data_range / bin_width))
+        n_bins = int(np.clip(n_bins, min_bins, max_bins))
+        edges = np.linspace(lo, hi, n_bins + 1)
+        return n_bins, edges
+
     # ============================================================
     # Score histogram with validation metric
     # ============================================================
@@ -506,411 +670,254 @@ class BinaryClassifierInterpreter:
         )
 
     # ============================================================
-    # Score-feature contours
+    # Interactive score-feature contours (Jupyter-safe)
     # ============================================================
-    @classmethod
-    def _extract_feature_column(cls, X, feature_name: Union[str, int]) -> np.ndarray:
-        if hasattr(X, "columns"):
-            if isinstance(feature_name, str):
-                if feature_name not in X.columns:
-                    raise KeyError(
-                        f"Feature '{feature_name}' not found in X.columns")
-                values = X[feature_name].to_numpy()
-                return cls._to_numpy_1d(values, f"feature '{feature_name}'").astype(float)
-            if isinstance(feature_name, int):
-                values = X.iloc[:, feature_name].to_numpy()
-                return cls._to_numpy_1d(values, f"feature index {feature_name}").astype(float)
-            raise TypeError(
-                "For DataFrame input feature_name must be str or int")
-
-        X_arr = np.asarray(X)
-        if X_arr.ndim != 2:
-            raise ValueError(f"X must be 2D, got shape={X_arr.shape}")
-        if not isinstance(feature_name, int):
-            raise TypeError(
-                "When X is not a DataFrame, feature_name must be an integer column index")
-        return cls._to_numpy_1d(X_arr[:, feature_name], f"feature index {feature_name}").astype(float)
-
-    @classmethod
-    def _joint_visual_clip_mask(
-        cls,
-        scores: np.ndarray,
-        feature_values: np.ndarray,
-        *,
-        score_q: Tuple[float, float] = (0.002, 0.998),
-        feature_q: Tuple[float, float] = (0.002, 0.998),
-    ) -> np.ndarray:
-        scores = cls._to_numpy_1d(scores, "scores")
-        feature_values = cls._to_numpy_1d(feature_values, "feature_values")
-        finite_mask = np.isfinite(scores) & np.isfinite(feature_values)
-        s = scores[finite_mask]
-        f = feature_values[finite_mask]
-        if len(s) < 10:
-            return finite_mask
-        s_lo, s_hi = np.quantile(s, score_q)
-        f_lo, f_hi = np.quantile(f, feature_q)
-        return finite_mask & (scores >= s_lo) & (scores <= s_hi) & (feature_values >= f_lo) & (feature_values <= f_hi)
-
-    @classmethod
-    def _adaptive_2d_bin_counts(
-        cls,
-        x: np.ndarray,
-        y: np.ndarray,
-        *,
-        min_bins: int = 25,
-        max_bins: int = 80,
-    ) -> Tuple[int, int]:
-        x = cls._to_numpy_1d(x, "x")
-        y = cls._to_numpy_1d(y, "y")
-        n = max(len(x), 1)
-        base = int(np.sqrt(n) / 3.0)
-        base = int(np.clip(base, min_bins, max_bins))
-        x_unique = len(np.unique(np.round(x, 8)))
-        y_unique = len(np.unique(np.round(y, 8)))
-        x_bins = int(
-            np.clip(min(base, max(10, x_unique // 3)), min_bins, max_bins))
-        y_bins = int(
-            np.clip(min(base, max(10, y_unique // 3)), min_bins, max_bins))
-        return x_bins, y_bins
-
-    @staticmethod
-    def _compute_hist2d_density(
-        x: np.ndarray,
-        y: np.ndarray,
-        *,
-        bins: Tuple[int, int],
-        x_range: Tuple[float, float],
-        y_range: Tuple[float, float],
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        H, x_edges, y_edges = np.histogram2d(
-            x, y, bins=bins, range=[x_range, y_range], density=True)
-        x_centers = 0.5 * (x_edges[:-1] + x_edges[1:])
-        y_centers = 0.5 * (y_edges[:-1] + y_edges[1:])
-        return H.T, x_centers, y_centers
-
-    @staticmethod
-    def _positive_contour_levels(
-        H: np.ndarray,
-        *,
-        n_levels: int = 8,
-        low_q: float = 0.55,
-        high_q: float = 0.98,
-    ) -> Optional[np.ndarray]:
-        positive = H[H > 0]
-        if positive.size < 2:
-            return None
-        lo = np.quantile(positive, low_q)
-        hi = np.quantile(positive, high_q)
-        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= 0:
-            return None
-        if hi <= lo:
-            return np.array([lo], dtype=float)
-        return np.linspace(lo, hi, n_levels)
-
-    @classmethod
-    def _draw_joint_hist_contours(
-        cls,
-        fig: plt.Figure,
-        subspec,
-        scores: np.ndarray,
-        feature_values: np.ndarray,
-        y_true: np.ndarray,
-        *,
-        title: str,
-        feature_label: str,
-        class_0_label: str = "False",
-        class_1_label: str = "True",
-        class_0_color: str = "tab:blue",
-        class_1_color: str = "tab:orange",
-        alpha_marginal: float = 0.45,
-        contour_linewidth: float = 1.6,
-        marginal_bins: int = 40,
-        hist2d_min_bins: int = 25,
-        hist2d_max_bins: int = 80,
-        score_q: Tuple[float, float] = (0.002, 0.998),
-        feature_q: Tuple[float, float] = (0.002, 0.998),
-    ):
-        inner = GridSpecFromSubplotSpec(
-            2,
-            2,
-            subplot_spec=subspec,
-            width_ratios=[4.5, 1.0],
-            height_ratios=[1.0, 4.5],
-            wspace=0.0,
-            hspace=0.0,
-        )
-        ax_top = fig.add_subplot(inner[0, 0])
-        ax_main = fig.add_subplot(inner[1, 0], sharex=ax_top)
-        ax_right = fig.add_subplot(inner[1, 1], sharey=ax_main)
-
-        mask = cls._joint_visual_clip_mask(
-            scores, feature_values, score_q=score_q, feature_q=feature_q)
-        s = scores[mask]
-        f = feature_values[mask]
-        y = y_true[mask]
-
-        s0 = s[y == 0]
-        s1 = s[y == 1]
-        f0 = f[y == 0]
-        f1 = f[y == 1]
-
-        if len(s) == 0:
-            raise ValueError(
-                f"No points left after clipping for panel '{title}'")
-
-        x_range = (float(np.min(s)), float(np.max(s)))
-        y_range = (float(np.min(f)), float(np.max(f)))
-        if x_range[0] == x_range[1]:
-            eps = 1e-6 if x_range[0] == 0 else abs(x_range[0]) * 1e-6
-            x_range = (x_range[0] - eps, x_range[1] + eps)
-        if y_range[0] == y_range[1]:
-            eps = 1e-6 if y_range[0] == 0 else abs(y_range[0]) * 1e-6
-            y_range = (y_range[0] - eps, y_range[1] + eps)
-
-        bins = cls._adaptive_2d_bin_counts(
-            s, f, min_bins=hist2d_min_bins, max_bins=hist2d_max_bins)
-        score_edges = np.linspace(x_range[0], x_range[1], marginal_bins + 1)
-        feature_edges = np.linspace(y_range[0], y_range[1], marginal_bins + 1)
-
-        ax_top.hist(s0, bins=score_edges, density=True,
-                    alpha=alpha_marginal, label=class_0_label, color=class_0_color)
-        ax_top.hist(s1, bins=score_edges, density=True,
-                    alpha=alpha_marginal, label=class_1_label, color=class_1_color)
-        ax_top.legend(loc="upper left")
-        ax_top.set_title(title)
-        ax_top.tick_params(axis="x", labelbottom=False)
-        ax_top.grid(True, alpha=0.2)
-
-        ax_right.hist(f0, bins=feature_edges, density=True,
-                      alpha=alpha_marginal, orientation="horizontal", color=class_0_color)
-        ax_right.hist(f1, bins=feature_edges, density=True,
-                      alpha=alpha_marginal, orientation="horizontal", color=class_1_color)
-        ax_right.tick_params(axis="y", labelleft=False)
-        ax_right.grid(True, alpha=0.2)
-
-        rng = np.random.default_rng(42)
-        max_scatter = 5000
-        if len(s0) > max_scatter:
-            idx0 = rng.choice(len(s0), size=max_scatter, replace=False)
-            s0_sc, f0_sc = s0[idx0], f0[idx0]
-        else:
-            s0_sc, f0_sc = s0, f0
-        if len(s1) > max_scatter:
-            idx1 = rng.choice(len(s1), size=max_scatter, replace=False)
-            s1_sc, f1_sc = s1[idx1], f1[idx1]
-        else:
-            s1_sc, f1_sc = s1, f1
-
-        ax_main.scatter(s0_sc, f0_sc, s=4, alpha=0.25, color=class_0_color)
-        ax_main.scatter(s1_sc, f1_sc, s=4, alpha=0.25, color=class_1_color)
-
-        if len(s0) >= 10:
-            H0, x_centers0, y_centers0 = cls._compute_hist2d_density(
-                s0, f0, bins=bins, x_range=x_range, y_range=y_range)
-            levels0 = cls._positive_contour_levels(H0)
-            if levels0 is not None:
-                X0, Y0 = np.meshgrid(x_centers0, y_centers0)
-                ax_main.contour(X0, Y0, H0, levels=levels0,
-                                linewidths=contour_linewidth, colors=[class_0_color])
-
-        if len(s1) >= 10:
-            H1, x_centers1, y_centers1 = cls._compute_hist2d_density(
-                s1, f1, bins=bins, x_range=x_range, y_range=y_range)
-            levels1 = cls._positive_contour_levels(H1)
-            if levels1 is not None:
-                X1, Y1 = np.meshgrid(x_centers1, y_centers1)
-                ax_main.contour(X1, Y1, H1, levels=levels1,
-                                linewidths=contour_linewidth, colors=[class_1_color])
-
-        ax_main.set_xlabel("model_score")
-        ax_main.set_ylabel(feature_label)
-        ax_main.grid(True, alpha=0.2)
-        return ax_top, ax_main, ax_right
 
     def plot_score_feature_contours(
         self,
-        feature_name: Union[str, int],
         *,
-        figsize: Tuple[int, int] = (16, 7),
+        features: Optional[Sequence[Any]] = None,
         title_prefix: Optional[str] = None,
         class_0_label: str = "False",
         class_1_label: str = "True",
-        class_0_color: str = "tab:blue",
-        class_1_color: str = "tab:orange",
-        alpha_marginal: float = 0.45,
-        contour_linewidth: float = 1.6,
-        marginal_bins: int = 40,
-        hist2d_min_bins: int = 25,
-        hist2d_max_bins: int = 80,
+        class_0_color: str = "royalblue",
+        class_1_color: str = "darkorange",
         score_q: Tuple[float, float] = (0.002, 0.998),
         feature_q: Tuple[float, float] = (0.002, 0.998),
-    ) -> ScoreFeatureContourPlotResult:
-        train_feature_values = self._extract_feature_column(
-            self.X_train, feature_name)
-        val_feature_values = self._extract_feature_column(
-            self.X_val, feature_name)
-        feature_label = str(feature_name)
+        hist2d_min_bins: int = 25,
+        hist2d_max_bins: int = 80,
+        max_scatter: int = 4000,
+        width: int = 1300,
+        height: int = 650,
+    ):
+        """
+        Jupyter-friendly interactive contour explorer.
 
-        fig = plt.figure(figsize=figsize, constrained_layout=True)
-        outer = GridSpec(1, 2, figure=fig, wspace=0.12)
-        train_title = "Train" if title_prefix is None else f"{title_prefix} — Train"
-        val_title = "Validation" if title_prefix is None else f"{title_prefix} — Validation"
+        Returns
+        -------
+        ipywidgets.VBox
+            Dropdown + FigureWidget. This avoids Plotly updatemenus JSON spam in notebook
+            frontends and updates traces in-place instead of stacking them.
+        """
+        if features is None:
+            features = self._get_float_feature_names(self.X_train)
+            if len(features) == 0:
+                features = self._get_feature_options(self.X_train)
+        else:
+            features = list(features)
 
-        self._draw_joint_hist_contours(
-            fig,
-            outer[0, 0],
-            self.train_scores,
-            train_feature_values,
-            self.y_train,
-            title=train_title,
-            feature_label=feature_label,
-            class_0_label=class_0_label,
-            class_1_label=class_1_label,
-            class_0_color=class_0_color,
-            class_1_color=class_1_color,
-            alpha_marginal=alpha_marginal,
-            contour_linewidth=contour_linewidth,
-            marginal_bins=marginal_bins,
-            hist2d_min_bins=hist2d_min_bins,
-            hist2d_max_bins=hist2d_max_bins,
-            score_q=score_q,
-            feature_q=feature_q,
+        if len(features) == 0:
+            raise ValueError(
+                "No features available for interactive contour plot.")
+
+        feature_options = [str(f) for f in features]
+        feature_map = {str(f): f for f in features}
+        rng = np.random.default_rng(42)
+
+        base_fig = make_subplots(
+            rows=1,
+            cols=2,
+            subplot_titles=(
+                "Train" if title_prefix is None else f"{title_prefix} — Train",
+                "Validation" if title_prefix is None else f"{title_prefix} — Validation",
+            ),
+            horizontal_spacing=0.10,
         )
-        self._draw_joint_hist_contours(
-            fig,
-            outer[0, 1],
-            self.val_scores,
-            val_feature_values,
-            self.y_val,
-            title=val_title,
-            feature_label=feature_label,
-            class_0_label=class_0_label,
-            class_1_label=class_1_label,
-            class_0_color=class_0_color,
-            class_1_color=class_1_color,
-            alpha_marginal=alpha_marginal,
-            contour_linewidth=contour_linewidth,
-            marginal_bins=marginal_bins,
-            hist2d_min_bins=hist2d_min_bins,
-            hist2d_max_bins=hist2d_max_bins,
-            score_q=score_q,
-            feature_q=feature_q,
+        fig = go.FigureWidget(base_fig)
+
+        # Precreate 8 traces: (train scatter0, train contour0, train scatter1, train contour1,
+        #                     val scatter0, val contour0, val scatter1, val contour1)
+        trace_specs = [
+            (1, 1, class_0_label, class_0_color, "train", 0, True),
+            (1, 1, class_0_label, class_0_color, "train", 0, False),
+            (1, 1, class_1_label, class_1_color, "train", 1, True),
+            (1, 1, class_1_label, class_1_color, "train", 1, False),
+            (1, 2, class_0_label, class_0_color, "val", 0, True),
+            (1, 2, class_0_label, class_0_color, "val", 0, False),
+            (1, 2, class_1_label, class_1_color, "val", 1, True),
+            (1, 2, class_1_label, class_1_color, "val", 1, False),
+        ]
+
+        for row, col, cls_label, cls_color, split_name, cls_value, is_scatter in trace_specs:
+            if is_scatter:
+                fig.add_trace(
+                    go.Scattergl(
+                        x=[],
+                        y=[],
+                        mode="markers",
+                        marker=dict(size=4, color=cls_color, opacity=0.22),
+                        name=f"{split_name} {cls_label} points",
+                        legendgroup=f"{split_name}_{cls_label}",
+                        showlegend=(split_name == "train"),
+                        hovertemplate="score=%{x:.4f}<br>feature=%{y:.4f}<extra></extra>",
+                    ),
+                    row=row,
+                    col=col,
+                )
+            else:
+                fig.add_trace(
+                    go.Histogram2dContour(
+                        x=[],
+                        y=[],
+                        nbinsx=30,
+                        nbinsy=30,
+                        histnorm="probability density",
+                        contours=dict(coloring="lines", showlabels=False),
+                        line=dict(color=cls_color, width=2),
+                        showscale=False,
+                        name=f"{split_name} {cls_label} contour",
+                        legendgroup=f"{split_name}_{cls_label}",
+                        showlegend=False,
+                        hoverinfo="skip",
+                    ),
+                    row=row,
+                    col=col,
+                )
+
+        fig.update_layout(
+            width=width,
+            height=height,
+            title="Score-feature contours",
+            legend=dict(orientation="h", yanchor="bottom",
+                        y=1.02, xanchor="left", x=0.0),
+            template="plotly_white",
+        )
+        fig.update_xaxes(title_text="model_score", row=1, col=1)
+        fig.update_xaxes(title_text="model_score", row=1, col=2)
+
+        dropdown = widgets.Dropdown(
+            options=feature_options,
+            value=feature_options[0],
+            description="Feature:",
+            layout=widgets.Layout(width="420px"),
         )
 
-        return ScoreFeatureContourPlotResult(
+        def _prepare_split(scores: np.ndarray, feature_values: np.ndarray, y_true: np.ndarray):
+            mask = self._joint_visual_clip_mask(
+                scores,
+                feature_values,
+                score_q=score_q,
+                feature_q=feature_q,
+            )
+            s = scores[mask]
+            f = feature_values[mask]
+            y = y_true[mask]
+
+            if len(s) == 0:
+                return None
+
+            x_bins, y_bins = self._adaptive_2d_bin_counts(
+                s,
+                f,
+                min_bins=hist2d_min_bins,
+                max_bins=hist2d_max_bins,
+            )
+
+            payload = {}
+            for cls_value in [0, 1]:
+                s_cls = s[y == cls_value]
+                f_cls = f[y == cls_value]
+
+                if len(s_cls) > max_scatter:
+                    idx = rng.choice(
+                        len(s_cls), size=max_scatter, replace=False)
+                    s_sc = s_cls[idx]
+                    f_sc = f_cls[idx]
+                else:
+                    s_sc = s_cls
+                    f_sc = f_cls
+
+                payload[cls_value] = {
+                    "s_sc": s_sc,
+                    "f_sc": f_sc,
+                    "s_cls": s_cls,
+                    "f_cls": f_cls,
+                    "x_bins": x_bins,
+                    "y_bins": y_bins,
+                }
+            return payload
+
+        def _update(feature_key: str):
+            feature_name = feature_map[feature_key]
+            train_feature_values = self._extract_feature_column(
+                self.X_train, feature_name)
+            val_feature_values = self._extract_feature_column(
+                self.X_val, feature_name)
+
+            train_payload = _prepare_split(
+                self.train_scores, train_feature_values, self.y_train)
+            val_payload = _prepare_split(
+                self.val_scores, val_feature_values, self.y_val)
+
+            if train_payload is None or val_payload is None:
+                raise ValueError(
+                    f"No points left after clipping for feature '{feature_name}'")
+
+            with fig.batch_update():
+                # train class 0
+                fig.data[0].x = train_payload[0]["s_sc"]
+                fig.data[0].y = train_payload[0]["f_sc"]
+                fig.data[1].x = train_payload[0]["s_cls"]
+                fig.data[1].y = train_payload[0]["f_cls"]
+                fig.data[1].nbinsx = train_payload[0]["x_bins"]
+                fig.data[1].nbinsy = train_payload[0]["y_bins"]
+
+                # train class 1
+                fig.data[2].x = train_payload[1]["s_sc"]
+                fig.data[2].y = train_payload[1]["f_sc"]
+                fig.data[3].x = train_payload[1]["s_cls"]
+                fig.data[3].y = train_payload[1]["f_cls"]
+                fig.data[3].nbinsx = train_payload[1]["x_bins"]
+                fig.data[3].nbinsy = train_payload[1]["y_bins"]
+
+                # val class 0
+                fig.data[4].x = val_payload[0]["s_sc"]
+                fig.data[4].y = val_payload[0]["f_sc"]
+                fig.data[5].x = val_payload[0]["s_cls"]
+                fig.data[5].y = val_payload[0]["f_cls"]
+                fig.data[5].nbinsx = val_payload[0]["x_bins"]
+                fig.data[5].nbinsy = val_payload[0]["y_bins"]
+
+                # val class 1
+                fig.data[6].x = val_payload[1]["s_sc"]
+                fig.data[6].y = val_payload[1]["f_sc"]
+                fig.data[7].x = val_payload[1]["s_cls"]
+                fig.data[7].y = val_payload[1]["f_cls"]
+                fig.data[7].nbinsx = val_payload[1]["x_bins"]
+                fig.data[7].nbinsy = val_payload[1]["y_bins"]
+
+                title = f"Score-feature contours — {feature_name}"
+                if title_prefix is not None:
+                    title = f"{title_prefix} — {feature_name}"
+                fig.layout.title = title
+                fig.layout.yaxis.title = str(feature_name)
+                fig.layout.yaxis2.title = str(feature_name)
+
+            return train_feature_values, val_feature_values
+
+        initial_train_feature_values, initial_val_feature_values = _update(
+            dropdown.value)
+
+        def _on_change(change):
+            if change["name"] == "value" and change["new"] is not None:
+                _update(change["new"])
+
+        dropdown.observe(_on_change, names="value")
+
+        box = widgets.VBox([dropdown, fig])
+        box._score_feature_result = ScoreFeatureContourPlotResult(
             fitted_model=self.model,
             fig=fig,
             train_scores=self.train_scores,
             val_scores=self.val_scores,
-            train_feature_values=train_feature_values,
-            val_feature_values=val_feature_values,
+            train_feature_values=initial_train_feature_values,
+            val_feature_values=initial_val_feature_values,
         )
+        return box
 
     # ============================================================
-    # Float feature histograms
+    # Interactive float feature histograms (Jupyter-safe)
     # ============================================================
-    @staticmethod
-    def _get_float_feature_names(X) -> list:
-        if hasattr(X, "dtypes") and hasattr(X, "columns"):
-            float_cols = []
-            for col in X.columns:
-                if np.issubdtype(X[col].dtype, np.floating):
-                    float_cols.append(col)
-            return float_cols
-
-        X_arr = np.asarray(X)
-        if X_arr.ndim != 2:
-            raise ValueError(f"X must be 2D, got shape={X_arr.shape}")
-        if np.issubdtype(X_arr.dtype, np.floating):
-            return list(range(X_arr.shape[1]))
-        return []
-
-    @classmethod
-    def _extract_feature_values(cls, X, feature_name: Any) -> np.ndarray:
-        if hasattr(X, "columns"):
-            if isinstance(feature_name, str):
-                if feature_name not in X.columns:
-                    raise KeyError(
-                        f"Feature '{feature_name}' not found in DataFrame")
-                values = X[feature_name].to_numpy()
-                return cls._to_numpy_1d(values, f"feature '{feature_name}'").astype(float)
-            if isinstance(feature_name, int):
-                values = X.iloc[:, feature_name].to_numpy()
-                return cls._to_numpy_1d(values, f"feature index {feature_name}").astype(float)
-            raise TypeError(
-                "For DataFrame input, feature_name must be str or int")
-
-        X_arr = np.asarray(X)
-        if X_arr.ndim != 2:
-            raise ValueError(f"X must be 2D, got shape={X_arr.shape}")
-        if not isinstance(feature_name, int):
-            raise TypeError(
-                "For ndarray input, feature_name must be an integer column index")
-        return cls._to_numpy_1d(X_arr[:, feature_name], f"feature index {feature_name}").astype(float)
-
-    @classmethod
-    def _feature_visual_clip_mask(
-        cls,
-        values: np.ndarray,
-        *,
-        lower_q: float = 0.002,
-        upper_q: float = 0.998,
-        iqr_k: float = 3.0,
-    ) -> np.ndarray:
-        values = cls._to_numpy_1d(values, "values")
-        finite_mask = np.isfinite(values)
-        v = values[finite_mask]
-        if len(v) < 10:
-            return finite_mask
-
-        q_lo, q_hi = np.quantile(v, [lower_q, upper_q])
-        q1, q3 = np.percentile(v, [25, 75])
-        iqr = q3 - q1
-        if iqr > 0 and np.isfinite(iqr):
-            iqr_lo = q1 - iqr_k * iqr
-            iqr_hi = q3 + iqr_k * iqr
-        else:
-            iqr_lo, iqr_hi = q_lo, q_hi
-        lo = max(q_lo, iqr_lo)
-        hi = min(q_hi, iqr_hi)
-        return finite_mask & (values >= lo) & (values <= hi)
-
-    @classmethod
-    def _adaptive_feature_bins(
-        cls,
-        values: np.ndarray,
-        *,
-        min_bins: int = 15,
-        max_bins: int = 80,
-        min_bin_width: Optional[float] = None,
-    ) -> Tuple[int, np.ndarray]:
-        values = cls._to_numpy_1d(values, "values")
-        values = values[np.isfinite(values)]
-        if len(values) == 0:
-            return min_bins, np.linspace(-1.0, 1.0, min_bins + 1)
-
-        lo = float(np.min(values))
-        hi = float(np.max(values))
-        data_range = hi - lo
-        if data_range <= 0:
-            eps = 1e-6 if lo == 0 else abs(lo) * 1e-6
-            return min_bins, np.linspace(lo - eps, hi + eps, min_bins + 1)
-
-        n = len(values)
-        q1, q3 = np.percentile(values, [25, 75])
-        iqr = q3 - q1
-        if iqr > 0:
-            bin_width = 2.0 * iqr / np.cbrt(n)
-        else:
-            bin_width = data_range / max(np.sqrt(n), 1.0)
-        if not np.isfinite(bin_width) or bin_width <= 0:
-            bin_width = data_range / max(np.sqrt(n), 1.0)
-        if min_bin_width is not None:
-            bin_width = max(bin_width, float(min_bin_width))
-        n_bins = int(np.ceil(data_range / bin_width))
-        n_bins = int(np.clip(n_bins, min_bins, max_bins))
-        edges = np.linspace(lo, hi, n_bins + 1)
-        return n_bins, edges
 
     def plot_float_feature_histograms(
         self,
@@ -919,8 +926,9 @@ class BinaryClassifierInterpreter:
         features: Optional[Sequence[Any]] = None,
         class_0_label: str = "class 0",
         class_1_label: str = "class 1",
-        alpha: float = 0.45,
-        figsize_per_feature: Tuple[float, float] = (12.0, 3.6),
+        class_0_color: str = "royalblue",
+        class_1_color: str = "darkorange",
+        alpha: float = 0.55,
         min_bins: int = 15,
         max_bins: int = 80,
         min_bin_width: Optional[float] = None,
@@ -928,8 +936,18 @@ class BinaryClassifierInterpreter:
         upper_q: float = 0.998,
         iqr_k: float = 3.0,
         density: bool = True,
-        max_features: Optional[int] = None,
+        width: int = 1200,
+        height: int = 550,
     ):
+        """
+        Jupyter-friendly interactive histogram explorer.
+
+        Returns
+        -------
+        ipywidgets.VBox
+            Dropdown + FigureWidget. Traces are updated in-place, so histograms do not
+            accumulate on top of each other after feature switches.
+        """
         if split == "train":
             X, y = self.X_train, self.y_train
         elif split == "val":
@@ -941,63 +959,149 @@ class BinaryClassifierInterpreter:
             features = self._get_float_feature_names(X)
         else:
             features = list(features)
-        if max_features is not None:
-            features = list(features)[:max_features]
+
         if len(features) == 0:
             raise ValueError("No float features found to plot.")
 
-        n_features = len(features)
-        fig_width, fig_height_per_row = figsize_per_feature
-        fig, axes = plt.subplots(
-            n_features,
-            2,
-            figsize=(fig_width, fig_height_per_row * n_features),
-            constrained_layout=True,
-            squeeze=False,
+        feature_options = [str(f) for f in features]
+        feature_map = {str(f): f for f in features}
+
+        base_fig = make_subplots(
+            rows=1,
+            cols=2,
+            subplot_titles=(f"overall ({split})", f"by class ({split})"),
+            horizontal_spacing=0.12,
+        )
+        fig = go.FigureWidget(base_fig)
+
+        histnorm = "probability density" if density else None
+
+        fig.add_trace(
+            go.Histogram(
+                x=[],
+                histnorm=histnorm,
+                marker=dict(color="steelblue"),
+                opacity=0.90,
+                name="overall",
+                showlegend=False,
+            ),
+            row=1,
+            col=1,
+        )
+        fig.add_trace(
+            go.Histogram(
+                x=[],
+                histnorm=histnorm,
+                marker=dict(color=class_0_color),
+                opacity=alpha,
+                name=class_0_label,
+                legendgroup="class0",
+                showlegend=True,
+            ),
+            row=1,
+            col=2,
+        )
+        fig.add_trace(
+            go.Histogram(
+                x=[],
+                histnorm=histnorm,
+                marker=dict(color=class_1_color),
+                opacity=alpha,
+                name=class_1_label,
+                legendgroup="class1",
+                showlegend=True,
+            ),
+            row=1,
+            col=2,
         )
 
-        for row_idx, feature_name in enumerate(features):
+        fig.update_layout(
+            width=width,
+            height=height,
+            barmode="overlay",
+            title="Feature histograms",
+            legend=dict(orientation="h", yanchor="bottom",
+                        y=1.02, xanchor="left", x=0.0),
+            template="plotly_white",
+        )
+        fig.update_yaxes(
+            title_text="Density" if density else "Count", row=1, col=1)
+        fig.update_yaxes(
+            title_text="Density" if density else "Count", row=1, col=2)
+
+        dropdown = widgets.Dropdown(
+            options=feature_options,
+            value=feature_options[0],
+            description="Feature:",
+            layout=widgets.Layout(width="420px"),
+        )
+
+        def _update(feature_key: str):
+            feature_name = feature_map[feature_key]
             values = self._extract_feature_values(X, feature_name)
+
             if len(values) != len(y):
                 raise ValueError(
-                    f"Feature '{feature_name}' length mismatch: len(values)={len(values)} vs len(y)={len(y)}")
+                    f"Feature '{feature_name}' length mismatch: len(values)={len(values)} vs len(y)={len(y)}"
+                )
 
             mask = self._feature_visual_clip_mask(
-                values, lower_q=lower_q, upper_q=upper_q, iqr_k=iqr_k)
+                values,
+                lower_q=lower_q,
+                upper_q=upper_q,
+                iqr_k=iqr_k,
+            )
             v = values[mask]
             y_masked = y[mask]
+
             if len(v) == 0:
                 raise ValueError(
                     f"All values were removed by clipping for feature '{feature_name}'")
 
             _, edges = self._adaptive_feature_bins(
-                v, min_bins=min_bins, max_bins=max_bins, min_bin_width=min_bin_width)
+                v,
+                min_bins=min_bins,
+                max_bins=max_bins,
+                min_bin_width=min_bin_width,
+            )
+
             v0 = v[y_masked == 0]
             v1 = v[y_masked == 1]
+            bin_size = float(edges[1] - edges[0]) if len(edges) > 1 else None
 
-            ax_left = axes[row_idx, 0]
-            ax_left.hist(v, bins=edges, density=density)
-            ax_left.set_title(f"{feature_name} — overall ({split})")
-            ax_left.set_xlabel(str(feature_name))
-            ax_left.set_ylabel("Density" if density else "Count")
-            ax_left.grid(True, alpha=0.25)
+            with fig.batch_update():
+                fig.data[0].x = v
+                fig.data[0].xbins.start = float(edges[0])
+                fig.data[0].xbins.end = float(edges[-1])
+                fig.data[0].xbins.size = bin_size
 
-            ax_right = axes[row_idx, 1]
-            ax_right.hist(v0, bins=edges, density=density,
-                          alpha=alpha, label=f"{class_0_label} (n={len(v0)})")
-            ax_right.hist(v1, bins=edges, density=density,
-                          alpha=alpha, label=f"{class_1_label} (n={len(v1)})")
-            ax_right.set_title(f"{feature_name} — by class ({split})")
-            ax_right.set_xlabel(str(feature_name))
-            ax_right.set_ylabel("Density" if density else "Count")
-            ax_right.grid(True, alpha=0.25)
-            ax_right.legend()
+                fig.data[1].x = v0
+                fig.data[1].xbins.start = float(edges[0])
+                fig.data[1].xbins.end = float(edges[-1])
+                fig.data[1].xbins.size = bin_size
 
-        return fig, axes
+                fig.data[2].x = v1
+                fig.data[2].xbins.start = float(edges[0])
+                fig.data[2].xbins.end = float(edges[-1])
+                fig.data[2].xbins.size = bin_size
+
+                fig.layout.title = f"Feature histograms — {feature_name} ({split})"
+                fig.layout.xaxis.title = str(feature_name)
+                fig.layout.xaxis2.title = str(feature_name)
+
+        _update(dropdown.value)
+
+        def _on_change(change):
+            if change["name"] == "value" and change["new"] is not None:
+                _update(change["new"])
+
+        dropdown.observe(_on_change, names="value")
+        return widgets.VBox([dropdown, fig])
 
     # ============================================================
     # SHAP
     # ============================================================
+
     def plot_shap_beeswarm(
         self,
         *,
@@ -1087,10 +1191,6 @@ class AutoFeatureStandardizer(BaseEstimator, TransformerMixin):
         self.feature_stats_: Dict[str, FeatureStats] = {}
         self.transforms_: Dict[str, str] = {}
 
-    # ============================================================
-    # Core stats
-    # ============================================================
-
     def _analyze_feature(self, x: np.ndarray) -> FeatureStats:
         mask = ~np.isnan(x)
         x_clean = x[mask]
@@ -1108,42 +1208,28 @@ class AutoFeatureStandardizer(BaseEstimator, TransformerMixin):
             min_val=np.min(x_clean),
         )
 
-    # ============================================================
-    # Fit
-    # ============================================================
-
     def fit(self, X: pd.DataFrame, y=None):
         self.feature_stats_ = {}
         self.transforms_ = {}
 
         for col in X.columns:
-            if not np.issubdtype(X[col].dtype, np.floating):
+            if not is_float_dtype(X[col]):
                 continue
 
             x = X[col].values.astype(float)
             stats = self._analyze_feature(x)
             self.feature_stats_[col] = stats
 
-            # -----------------------------
-            # Decision logic
-            # -----------------------------
             if stats.skew > self.skew_threshold:
                 self.transforms_[col] = "log"
-
             elif stats.max_ratio > 0.05:
                 self.transforms_[col] = "cap"
-
             elif stats.zero_ratio > self.zero_threshold:
                 self.transforms_[col] = "zero"
-
             else:
                 self.transforms_[col] = "none"
 
         return self
-
-    # ============================================================
-    # Transform
-    # ============================================================
 
     def transform(self, X: pd.DataFrame) -> pd.DataFrame:
         X_out = X.copy()
@@ -1154,40 +1240,28 @@ class AutoFeatureStandardizer(BaseEstimator, TransformerMixin):
 
             x = X_out[col].values.astype(float)
             stats = self.feature_stats_[col]
-
             mask = ~np.isnan(x)
 
-            # -------- LOG TRANSFORM --------
             if transform_type == "log":
                 x_new = x.copy()
                 x_new[mask] = np.log1p(x[mask])
                 X_out[col] = x_new
 
-            # -------- CAP FIX --------
             elif transform_type == "cap":
                 cap = stats.max_val
-
                 if self.add_indicators:
                     X_out[f"{col}_is_capped"] = (x == cap).astype(float)
-
                 x_new = x.copy()
                 x_new[mask] = np.minimum(x[mask], cap - 1)
                 X_out[col] = x_new
 
-            # -------- ZERO SPLIT --------
             elif transform_type == "zero":
                 if self.add_indicators:
                     X_out[f"{col}_is_zero"] = (x == 0).astype(float)
-
                 x_new = x.copy()
                 x_new[mask] = np.log1p(x[mask])
                 X_out[col] = x_new
 
-            # -------- NONE --------
-            else:
-                pass
-
-            # -------- NaN indicator (optional) --------
             if self.add_indicators:
                 X_out[f"{col}_is_nan"] = np.isnan(x).astype(float)
 
