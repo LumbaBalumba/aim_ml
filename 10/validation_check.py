@@ -17,12 +17,9 @@ def get_train_val_difference(X_train, y_train, X_val, y_val, model_kwargs={}):
 
     X_t, X_v, y_t, y_v = train_test_split(X, y)
 
-    cat_features = list(X_t.select_dtypes('category').columns) + \
-        list(X_t.select_dtypes('object').columns)
+    train_pool = Pool(X_t, label=y_t, cat_features=model_kwargs['cat_features'])
 
-    train_pool = Pool(X_t, label=y_t, cat_features=cat_features)
-
-    val_pool = Pool(X_v, label=y_v, cat_features=cat_features)
+    val_pool = Pool(X_v, label=y_v, cat_features=model_kwargs['cat_features'])
 
     model = CatBoostClassifier(**model_kwargs).fit(
         train_pool,

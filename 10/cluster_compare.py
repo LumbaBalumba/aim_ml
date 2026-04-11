@@ -51,6 +51,8 @@ class ClusterComparisonResult:
     scores_cluster_1: np.ndarray
     scores_cluster_2: np.ndarray
     fitted_model: CatBoostClassifier
+    cluster_1_label_distribution: Dict[Any, float]
+    cluster_2_label_distribution: Dict[Any, float]
 
 
 class NotebookBinaryClusterInterpreter:
@@ -335,7 +337,9 @@ class NotebookBinaryClusterInterpreter:
     def _default_metrics_html() -> str:
         return (
             "<b>Comparison metrics</b><br>"
-            "Select two clusters and click <i>Compare selected clusters</i>."
+            "Select two clusters and click <i>Compare selected clusters</i>.<br><br>"
+            "<b>Cluster label distribution</b><br>"
+            "Available only if original y was provided."
         )
 
     def _refresh_cluster_widgets(self) -> None:
@@ -504,6 +508,40 @@ class NotebookBinaryClusterInterpreter:
         idx = sorted(self.cluster_to_indices[cluster_name])
         return self.X_numeric[idx]
 
+    def _cluster_label_distribution(self, indices: np.ndarray) -> Dict[Any, float]:
+        """
+        Returns percentage distribution of original y labels inside a cluster.
+        Example:
+            {0: 73.5, 1: 26.5}
+        """
+        if self.y is None:
+            return {}
+
+        labels = np.asarray(self.y)[indices]
+        if len(labels) == 0:
+            return {}
+
+        unique, counts = np.unique(labels, return_counts=True)
+        total = counts.sum()
+
+        return {
+            unique_label.item() if hasattr(unique_label, "item") else unique_label: float(count / total * 100.0)
+            for unique_label, count in zip(unique, counts)
+        }
+
+    @staticmethod
+    def _format_label_distribution_html(
+        distribution: Dict[Any, float],
+        cluster_name: str,
+    ) -> str:
+        if not distribution:
+            return f"<b>{cluster_name} label distribution:</b><br>Unavailable"
+
+        parts = [f"<b>{cluster_name} label distribution:</b>"]
+        for label, pct in sorted(distribution.items(), key=lambda x: x[0]):
+            parts.append(f"class {label}: {pct:.2f}%")
+        return "<br>".join(parts)
+
     def _on_compare_clusters(self) -> None:
         cluster_a = self.cluster_a_select.value
         cluster_b = self.cluster_b_select.value
@@ -522,6 +560,9 @@ class NotebookBinaryClusterInterpreter:
 
         idx_a = np.array(sorted(self.cluster_to_indices[cluster_a]), dtype=int)
         idx_b = np.array(sorted(self.cluster_to_indices[cluster_b]), dtype=int)
+
+        cluster_a_label_distribution = self._cluster_label_distribution(idx_a)
+        cluster_b_label_distribution = self._cluster_label_distribution(idx_b)
 
         if len(idx_a) < 5 or len(idx_b) < 5:
             self.metrics_div.text = (
@@ -606,6 +647,15 @@ class NotebookBinaryClusterInterpreter:
         self.hist_right_fig.renderers[-1].glyph.fill_color = color_b
         self.hist_right_fig.renderers[-1].glyph.line_color = color_b
 
+        cluster_a_dist_html = self._format_label_distribution_html(
+            cluster_a_label_distribution,
+            cluster_a,
+        )
+        cluster_b_dist_html = self._format_label_distribution_html(
+            cluster_b_label_distribution,
+            cluster_b,
+        )
+
         self.metrics_div.text = (
             f"<b>Comparison metrics: {cluster_a} vs {cluster_b}</b><br>"
             f"Precision: {precision:.4f}<br>"
@@ -614,7 +664,9 @@ class NotebookBinaryClusterInterpreter:
             f"ROC AUC: {roc_auc:.4f}<br>"
             f"Optimal threshold: {best_threshold:.6f}<br>"
             f"Train size: {len(train_idx)}<br>"
-            f"Test size: {len(test_idx)}"
+            f"Test size: {len(test_idx)}<br><br>"
+            f"{cluster_a_dist_html}<br><br>"
+            f"{cluster_b_dist_html}"
         )
 
         self.last_comparison_result = ClusterComparisonResult(
@@ -630,6 +682,8 @@ class NotebookBinaryClusterInterpreter:
             scores_cluster_1=scores_cluster_a,
             scores_cluster_2=scores_cluster_b,
             fitted_model=model,
+            cluster_1_label_distribution=cluster_a_label_distribution,
+            cluster_2_label_distribution=cluster_b_label_distribution,
         )
 
     # ============================================================

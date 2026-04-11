@@ -10,7 +10,7 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.pipeline import Pipeline
 
 # text hyperparams
-N_SVD_COMPONENTS = 16
+N_SVD_COMPONENTS = 8
 MIN_DF = 5
 MAX_DF = 0.8
 MAX_FEATURES = 5000
@@ -751,4 +751,4 @@ class OzonDataFormer:
             cs.numeric().fill_null(strategy="zero"),
             cs.string().fill_null(""),
             cs.categorical().fill_null("NONE"),
-        ).collect(engine="streaming")
+        ).collect(engine="streaming").to_pandas().sort_index(axis=1)
