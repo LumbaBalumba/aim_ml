@@ -714,9 +714,9 @@ class OzonDataFormer:
         target_start_date: date | None = None,
         target_end_date: date | None = None,
         users_df: pl.LazyFrame | None = None,
-        include_actions: bool = True,
-        include_search: bool = True,
-        include_price: bool = True,
+        include_actions: bool = False,
+        include_search: bool = False,
+        include_price: bool = False,
     ) -> pl.DataFrame:
         if target_start_date is not None and target_end_date is not None:
             df = self._make_target(target_start_date, target_end_date)
