@@ -1265,4 +1265,4 @@ class AutoFeatureStandardizer(BaseEstimator, TransformerMixin):
             if self.add_indicators:
                 X_out[f"{col}_is_nan"] = np.isnan(x).astype(float)
 
-        return X_out
+        return X_out.copy()

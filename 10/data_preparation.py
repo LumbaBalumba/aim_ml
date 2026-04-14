@@ -74,7 +74,8 @@ class OzonDataFormer:
 
     def _make_target(self, target_start: date, target_end: date) -> pl.LazyFrame:
         return (
-            self.actions_history.filter(pl.col("timestamp").dt.date() >= target_start)
+            self.actions_history.filter(
+                pl.col("timestamp").dt.date() >= target_start)
             .filter(pl.col("timestamp").dt.date() <= target_end)
             .group_by("user_id")
             .agg((pl.col("action_type") == "order").max().cast(pl.Int8).alias("target"))
@@ -96,7 +97,8 @@ class OzonDataFormer:
             )
             .filter(pl.col("timestamp").dt.date() <= feature_end_date)
             .filter(
-                pl.col("timestamp").dt.date() >= feature_end_date - timedelta(days=30)
+                pl.col("timestamp").dt.date() >= feature_end_date -
+                timedelta(days=30)
             )
             .group_by("user_id")
             .agg(
@@ -110,7 +112,8 @@ class OzonDataFormer:
         )
 
         texts = (
-            search_df["all_queries_text_30d"].to_list() if len(search_df) > 0 else [""]
+            search_df["all_queries_text_30d"].to_list() if len(
+                search_df) > 0 else [""]
         )
         self.vectorizer.fit(texts)
         self._vectorizer_is_fitted = True
@@ -137,13 +140,15 @@ class OzonDataFormer:
                 )
                 .filter(pl.col("action_type") == action_name)
                 .join(
-                    self.product_information.select("product_id", "discount_price"),
+                    self.product_information.select(
+                        "product_id", "discount_price"),
                     on="product_id",
                     how="left",
                 )
                 .group_by("user_id")
                 .agg(
-                    pl.count("product_id").cast(pl.Int32).alias(f"num_products_{suf}"),
+                    pl.count("product_id").
+                    cast(pl.Int32).alias(f"num_products_{suf}"),
                     pl.sum("discount_price")
                     .cast(pl.Float32)
                     .alias(f"sum_discount_price_{suf}"),
@@ -155,11 +160,13 @@ class OzonDataFormer:
                 )
                 .with_columns(
                     [
-                        (pl.lit(anchor_date) - pl.col(f"last_{suf}_time").dt.date())
+                        (pl.lit(anchor_date) -
+                         pl.col(f"last_{suf}_time").dt.date())
                         .dt.total_days()
                         .cast(pl.Int32)
                         .alias(f"days_since_last_{suf}"),
-                        (pl.lit(anchor_date) - pl.col(f"first_{suf}_time").dt.date())
+                        (pl.lit(anchor_date) -
+                         pl.col(f"first_{suf}_time").dt.date())
                         .dt.total_days()
                         .cast(pl.Int32)
                         .alias(f"days_since_first_{suf}"),
@@ -180,7 +187,8 @@ class OzonDataFormer:
             self.search_history.filter(pl.col("action_type") == "search")
             .filter(pl.col("timestamp").dt.date() <= feature_end_date)
             .filter(
-                pl.col("timestamp").dt.date() >= feature_end_date - timedelta(days=120)
+                pl.col("timestamp").dt.date() >= feature_end_date -
+                timedelta(days=120)
             )
             .group_by("user_id")
             .agg(
@@ -213,16 +221,19 @@ class OzonDataFormer:
 
     def _get_intent_features(self, feature_end_date: date) -> pl.LazyFrame:
         intent_df = (
-            self.actions_history.with_columns(pl.col("timestamp").cast(pl.Datetime))
+            self.actions_history.with_columns(
+                pl.col("timestamp").cast(pl.Datetime))
             .filter(pl.col("timestamp").dt.date() <= feature_end_date)
             .sort(["user_id", "timestamp"])
         )
 
         intent_df_7d = intent_df.filter(
-            pl.col("timestamp").dt.date() >= feature_end_date - timedelta(days=7)
+            pl.col("timestamp").dt.date() >= feature_end_date -
+            timedelta(days=7)
         )
         intent_df_30d = intent_df.filter(
-            pl.col("timestamp").dt.date() >= feature_end_date - timedelta(days=30)
+            pl.col("timestamp").dt.date() >= feature_end_date -
+            timedelta(days=30)
         )
 
         agg_7d = intent_df_7d.group_by("user_id").agg(
@@ -230,7 +241,8 @@ class OzonDataFormer:
                 (pl.col("action_type") == "to_cart")
                 .sum()
                 .alias("add_to_cart_count_7d"),
-                (pl.col("action_type") == "click").sum().alias("product_clicks_7d"),
+                (pl.col("action_type") == "click").sum().alias(
+                    "product_clicks_7d"),
             ]
         )
 
@@ -299,18 +311,22 @@ class OzonDataFormer:
             .agg(pl.col("action_type").tail(3).alias("last_3_actions"))
             .with_columns(
                 [
-                    pl.col("last_3_actions").list.len().alias("last_actions_count"),
+                    pl.col("last_3_actions").list.len().alias(
+                        "last_actions_count"),
                     pl.col("last_3_actions")
                     .list.get(-1, null_on_oob=True)
                     .fill_null("NONE")
+                    .cast(pl.Categorical)
                     .alias("last_action"),
                     pl.col("last_3_actions")
                     .list.get(-2, null_on_oob=True)
                     .fill_null("NONE")
+                    .cast(pl.Categorical)
                     .alias("last_2_action"),
                     pl.col("last_3_actions")
                     .list.get(-3, null_on_oob=True)
                     .fill_null("NONE")
+                    .cast(pl.Categorical)
                     .alias("last_3_action"),
                 ]
             )
@@ -319,7 +335,7 @@ class OzonDataFormer:
                     pl.concat_str(
                         ["last_3_action", "last_2_action", "last_action"],
                         separator="__",
-                    ).alias("last_3_actions_str")
+                    ).cast(pl.Categorical).alias("last_3_actions_str")
                 ]
             )
             .drop("last_3_actions")
@@ -368,7 +384,8 @@ class OzonDataFormer:
         ) -> list[pl.Expr]:
             exprs = []
             for kw in prefixes:
-                safe = re.sub(r"[^a-zA-Zа-яА-Я0-9]+", "_", kw.lower()).strip("_")
+                safe = re.sub(r"[^a-zA-Zа-яА-Я0-9]+",
+                              "_", kw.lower()).strip("_")
                 exprs.append(
                     pl.col(query_col)
                     .str.contains(re.escape(kw), literal=False)
@@ -382,7 +399,8 @@ class OzonDataFormer:
             self.search_history.with_columns(
                 [
                     pl.col("timestamp").cast(pl.Datetime),
-                    normalize_query_expr("search_query").alias("search_query_norm"),
+                    normalize_query_expr("search_query").alias(
+                        "search_query_norm"),
                 ]
             )
             .filter(pl.col("timestamp").dt.date() <= feature_end_date)
@@ -391,37 +409,51 @@ class OzonDataFormer:
 
         query_level = search_df.with_columns(
             [
-                pl.col("search_query_norm").str.len_chars().alias("query_len_chars"),
+                pl.col("search_query_norm").str.len_chars().alias(
+                    "query_len_chars"),
                 pl.col("search_query_norm")
                 .str.split(" ")
                 .list.len()
                 .alias("query_len_words"),
             ]
-            + build_keyword_flag_exprs("search_query_norm", PRODUCT_KEYWORDS, "product")
+            + build_keyword_flag_exprs("search_query_norm",
+                                       PRODUCT_KEYWORDS, "product")
         )
 
         query_level_7d = query_level.filter(
-            pl.col("timestamp").dt.date() >= feature_end_date - timedelta(days=7)
+            pl.col("timestamp").dt.date() >= feature_end_date -
+            timedelta(days=7)
         )
         query_level_30d = query_level.filter(
-            pl.col("timestamp").dt.date() >= feature_end_date - timedelta(days=30)
+            pl.col("timestamp").dt.date() >= feature_end_date -
+            timedelta(days=30)
         )
 
         basic_30d = query_level_30d.group_by("user_id").agg(
             [
                 pl.len().alias("search_count_30d"),
-                pl.col("search_query_norm").n_unique().alias("unique_queries_30d"),
-                pl.col("query_len_chars").mean().alias("avg_query_len_chars_30d"),
-                pl.col("query_len_chars").median().alias("median_query_len_chars_30d"),
-                pl.col("query_len_words").mean().alias("avg_query_len_words_30d"),
-                pl.col("query_len_words").max().alias("max_query_len_words_30d"),
+                pl.col("search_query_norm")
+                .n_unique().alias(
+                    "unique_queries_30d"),
+                pl.col("query_len_chars")
+                .mean().alias("avg_query_len_chars_30d"),
+                pl.col("query_len_chars")
+                .median().alias("median_query_len_chars_30d"),
+                pl.col("query_len_words")
+                .mean()
+                .alias("avg_query_len_words_30d"),
+                pl.col("query_len_words")
+                .max()
+                .alias("max_query_len_words_30d"),
             ]
         )
 
         basic_7d = query_level_7d.group_by("user_id").agg(
             [
                 pl.len().alias("search_count_7d"),
-                pl.col("search_query_norm").n_unique().alias("unique_queries_7d"),
+                pl.col("search_query_norm")
+                .n_unique()
+                .alias("unique_queries_7d"),
             ]
         )
 
@@ -447,7 +479,8 @@ class OzonDataFormer:
                 ]
             )
 
-        keyword_features = query_level_30d.group_by("user_id").agg(keyword_aggs)
+        keyword_features = query_level_30d.group_by(
+            "user_id").agg(keyword_aggs)
 
         keyword_summary = query_level_30d.group_by("user_id").agg(
             [
@@ -483,7 +516,8 @@ class OzonDataFormer:
                 user_docs_pd["all_queries_text_30d"].fillna("")
             )
 
-            svd_cols = [f"search_tfidf_svd_{i:02d}" for i in range(X_vec.shape[1])]
+            svd_cols = [
+                f"search_tfidf_svd_{i:02d}" for i in range(X_vec.shape[1])]
             tfidf_svd_features = (
                 pl.DataFrame(
                     {
@@ -500,9 +534,15 @@ class OzonDataFormer:
         last_query_features = (
             query_level.group_by("user_id").agg(
                 [
-                    pl.col("search_query_norm").last().alias("last_search_query"),
-                    pl.col("query_len_chars").last().alias("last_search_len_chars"),
-                    pl.col("query_len_words").last().alias("last_search_len_words"),
+                    pl.col("search_query_norm")
+                    .last()
+                    .alias("last_search_query"),
+                    pl.col("query_len_chars")
+                    .last()
+                    .alias("last_search_len_chars"),
+                    pl.col("query_len_words")
+                    .last()
+                    .alias("last_search_len_words"),
                 ]
             )
         ).with_columns(
@@ -518,7 +558,7 @@ class OzonDataFormer:
                     for kw in PRODUCT_KEYWORDS
                 ]
             ]
-        )
+        ).drop('last_search_query')
 
         return (
             basic_30d.join(recency, on="user_id", how="full", coalesce=True)
@@ -535,7 +575,8 @@ class OzonDataFormer:
                 pl.col("timestamp").dt.date() <= feature_end_date
             )
             .filter(
-                pl.col("timestamp").dt.date() >= feature_end_date - timedelta(days=120)
+                pl.col("timestamp").dt.date() >= feature_end_date -
+                timedelta(days=120)
             )
             .filter(pl.col("product_id").is_not_null())
         )
@@ -545,9 +586,9 @@ class OzonDataFormer:
                 pl.col("price").cast(pl.Float64),
                 pl.col("discount_price").cast(pl.Float64),
                 pl.col("category_id").cast(pl.Int64),
-                pl.col("category_name").cast(pl.String),
-                pl.col("brand").cast(pl.String),
-                pl.col("type").cast(pl.String),
+                pl.col("category_name").cast(pl.Categorical),
+                pl.col("brand").cast(pl.Categorical),
+                pl.col("type").cast(pl.Categorical),
             ]
         ).select(
             [
@@ -592,16 +633,27 @@ class OzonDataFormer:
             ]
         )
 
-        product_events = events.filter(pl.col("action_type").is_in(PRODUCT_ACTIONS))
-        price_events = events.filter(pl.col("action_type").is_in(PRICE_ACTIONS))
+        product_events = events.filter(
+            pl.col("action_type").is_in(PRODUCT_ACTIONS))
+        price_events = events.filter(
+            pl.col("action_type").is_in(PRICE_ACTIONS))
 
         price_features = price_events.group_by("user_id").agg(
             [
-                pl.col("effective_price").mean().alias("avg_viewed_price"),
-                pl.col("effective_price").median().alias("median_viewed_price"),
-                pl.col("effective_price").max().alias("max_viewed_price"),
-                pl.col("discount_ratio").mean().alias("discount_ratio_mean"),
-                pl.col("is_discounted").mean().alias("fraction_discounted_products"),
+                pl.col("effective_price")
+                .mean()
+                .alias("avg_viewed_price"),
+                pl.col("effective_price")
+                .median()
+                .alias("median_viewed_price"),
+                pl.col("effective_price")
+                .max()
+                .alias("max_viewed_price"),
+                pl.col("discount_ratio")
+                .mean()
+                .alias("discount_ratio_mean"),
+                pl.col("is_discounted")
+                .mean().alias("fraction_discounted_products"),
             ]
         )
 
@@ -615,7 +667,8 @@ class OzonDataFormer:
             user_category_counts.group_by("user_id")
             .agg(
                 [
-                    pl.col("category_event_count").sum().alias("total_category_events"),
+                    pl.col("category_event_count").sum().alias(
+                        "total_category_events"),
                     pl.col("category_event_count")
                     .max()
                     .alias("favorite_category_count"),
@@ -634,14 +687,16 @@ class OzonDataFormer:
 
         category_entropy = (
             user_category_counts.join(
-                user_category_totals.select(["user_id", "total_category_events"]),
+                user_category_totals.select(
+                    ["user_id", "total_category_events"]),
                 on="user_id",
                 how="left",
             )
             .with_columns(
                 [
                     (
-                        pl.col("category_event_count") / pl.col("total_category_events")
+                        pl.col("category_event_count") /
+                        pl.col("total_category_events")
                     ).alias("p_cat")
                 ]
             )
@@ -669,11 +724,13 @@ class OzonDataFormer:
         top_category_ids = top_categories["category_id"].to_list()
 
         user_top_category_features = (
-            product_events.filter(pl.col("category_id").is_in(top_category_ids))
+            product_events.filter(
+                pl.col("category_id").is_in(top_category_ids))
             .group_by(["user_id", "category_id"])
             .agg(pl.len().alias("cnt"))
             .join(
-                user_category_totals.select(["user_id", "total_category_events"]),
+                user_category_totals.select(
+                    ["user_id", "total_category_events"]),
                 on="user_id",
                 how="left",
             )
@@ -717,13 +774,15 @@ class OzonDataFormer:
         include_actions: bool = False,
         include_search: bool = False,
         include_price: bool = False,
+        group_embedding_features: bool = False
     ) -> pl.DataFrame:
         if target_start_date is not None and target_end_date is not None:
             df = self._make_target(target_start_date, target_end_date)
         elif users_df is not None:
             df = users_df
         else:
-            raise ValueError("Either target dates or users_df must be provided.")
+            raise ValueError(
+                "Either target dates or users_df must be provided.")
 
         aggs = self._get_basic_features(
             feature_end_date=feature_end_date, anchor_date=feature_end_date
@@ -747,8 +806,16 @@ class OzonDataFormer:
                 self._get_price_features(feature_end_date), on="user_id", how="left"
             )
 
-        return df.with_columns(
+        df = df.with_columns(
             cs.numeric().fill_null(strategy="zero"),
             cs.string().fill_null(""),
             cs.categorical().fill_null("NONE"),
-        ).collect(engine="streaming").to_pandas().sort_index(axis=1)
+        )
+
+        if group_embedding_features:
+            df = df.with_columns(
+                pl.concat_list([f"search_tfidf_svd_{i:02d}"
+                                for i in range(N_SVD_COMPONENTS)]).alias('search_emb')
+            )
+
+        return df.collect(engine="streaming").to_pandas().sort_index(axis=1)
