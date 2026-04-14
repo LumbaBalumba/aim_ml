@@ -765,6 +765,407 @@ class OzonDataFormer:
             category_features, on="user_id", how="full", coalesce=True
         )
 
+    def _get_trend_features(self, feature_end_date: date) -> pl.LazyFrame:
+        actions_df = (
+            self.actions_history
+            .filter(pl.col("timestamp").dt.date() <= feature_end_date)
+            .filter(pl.col("timestamp").dt.date() >= feature_end_date - timedelta(days=60))
+        )
+
+        def _agg_for_window(start_date: date, end_date: date, suffix: str) -> pl.LazyFrame:
+            window_df = actions_df.filter(
+                (pl.col("timestamp").dt.date() >= start_date) &
+                (pl.col("timestamp").dt.date() <= end_date)
+            )
+
+            return window_df.group_by("user_id").agg([
+                pl.len().alias(f"actions_count_{suffix}"),
+                (pl.col("action_type") == "click").sum().alias(
+                    f"click_count_{suffix}"),
+                (pl.col("action_type") == "to_cart").sum().alias(
+                    f"to_cart_count_{suffix}"),
+                (pl.col("action_type") == "favorite").sum().alias(
+                    f"favorite_count_{suffix}"),
+                (pl.col("action_type") == "order").sum().alias(
+                    f"order_count_{suffix}"),
+                pl.col("product_id").n_unique().alias(
+                    f"unique_products_{suffix}"),
+            ])
+
+        last_7_start = feature_end_date - timedelta(days=6)
+        prev_7_start = feature_end_date - timedelta(days=13)
+        prev_7_end = feature_end_date - timedelta(days=7)
+
+        last_30_start = feature_end_date - timedelta(days=29)
+        prev_30_start = feature_end_date - timedelta(days=59)
+        prev_30_end = feature_end_date - timedelta(days=30)
+
+        last_7 = _agg_for_window(last_7_start, feature_end_date, "last_7d")
+        prev_7 = _agg_for_window(prev_7_start, prev_7_end, "prev_7d")
+        last_30 = _agg_for_window(last_30_start, feature_end_date, "last_30d")
+        prev_30 = _agg_for_window(prev_30_start, prev_30_end, "prev_30d")
+
+        trend = (
+            last_7
+            .join(prev_7, on="user_id", how="full", coalesce=True)
+            .join(last_30, on="user_id", how="full", coalesce=True)
+            .join(prev_30, on="user_id", how="full", coalesce=True)
+            .with_columns([
+                (pl.col("actions_count_last_7d") -
+                 pl.col("actions_count_prev_7d")).alias("actions_trend_delta_7d"),
+                ((pl.col("actions_count_last_7d") + 1) /
+                 (pl.col("actions_count_prev_7d") + 1)).alias("actions_trend_ratio_7d"),
+
+                (pl.col("click_count_last_7d") -
+                 pl.col("click_count_prev_7d")).alias("click_trend_delta_7d"),
+                ((pl.col("click_count_last_7d") + 1) /
+                 (pl.col("click_count_prev_7d") + 1)).alias("click_trend_ratio_7d"),
+
+                (pl.col("to_cart_count_last_7d") -
+                 pl.col("to_cart_count_prev_7d")).alias("to_cart_trend_delta_7d"),
+                ((pl.col("to_cart_count_last_7d") + 1) /
+                 (pl.col("to_cart_count_prev_7d") + 1)).alias("to_cart_trend_ratio_7d"),
+
+                (pl.col("order_count_last_30d") -
+                 pl.col("order_count_prev_30d")).alias("order_trend_delta_30d"),
+                ((pl.col("order_count_last_30d") + 1) /
+                 (pl.col("order_count_prev_30d") + 1)).alias("order_trend_ratio_30d"),
+
+                (pl.col("unique_products_last_7d") - pl.col("unique_products_prev_7d")
+                 ).alias("unique_products_trend_delta_7d"),
+                ((pl.col("unique_products_last_7d") + 1) /
+                 (pl.col("unique_products_prev_7d") + 1)).alias("unique_products_trend_ratio_7d"),
+            ])
+        )
+
+        search_df = (
+            self.search_history
+            .filter(pl.col("timestamp").dt.date() <= feature_end_date)
+            .filter(pl.col("timestamp").dt.date() >= feature_end_date - timedelta(days=60))
+        )
+
+        def _search_agg_for_window(start_date: date, end_date: date, suffix: str) -> pl.LazyFrame:
+            window_df = search_df.filter(
+                (pl.col("timestamp").dt.date() >= start_date) &
+                (pl.col("timestamp").dt.date() <= end_date)
+            )
+            return window_df.group_by("user_id").agg([
+                pl.len().alias(f"search_count_{suffix}"),
+                pl.col("search_query").n_unique().alias(
+                    f"unique_searches_{suffix}"),
+            ])
+
+        search_last_7 = _search_agg_for_window(
+            last_7_start, feature_end_date, "last_7d")
+        search_prev_7 = _search_agg_for_window(
+            prev_7_start, prev_7_end, "prev_7d")
+
+        search_trend = (
+            search_last_7
+            .join(search_prev_7, on="user_id", how="full", coalesce=True)
+            .with_columns([
+                (pl.col("search_count_last_7d") -
+                 pl.col("search_count_prev_7d")).alias("search_trend_delta_7d"),
+                ((pl.col("search_count_last_7d") + 1) /
+                 (pl.col("search_count_prev_7d") + 1)).alias("search_trend_ratio_7d"),
+                (pl.col("unique_searches_last_7d") - pl.col("unique_searches_prev_7d")
+                 ).alias("unique_searches_trend_delta_7d"),
+            ])
+        )
+
+        return trend.join(search_trend, on="user_id", how="full", coalesce=True)
+
+    def _get_search_action_conversion_features(self, feature_end_date: date) -> pl.LazyFrame:
+        search_events = (
+            self.search_history
+            .filter(pl.col("timestamp").dt.date() <= feature_end_date)
+            .filter(pl.col("timestamp").dt.date() >= feature_end_date - timedelta(days=30))
+            .select([
+                "user_id",
+                pl.col("timestamp").cast(pl.Datetime),
+                pl.lit("search").alias("event_kind"),
+                pl.lit(None).cast(pl.String).alias("action_kind"),
+            ])
+        )
+
+        action_events = (
+            self.actions_history
+            .filter(pl.col("timestamp").dt.date() <= feature_end_date)
+            .filter(pl.col("timestamp").dt.date() >= feature_end_date - timedelta(days=30))
+            .filter(pl.col("action_type").is_in(["click", "to_cart", "favorite", "order"]))
+            .select([
+                "user_id",
+                pl.col("timestamp").cast(pl.Datetime),
+                pl.lit("action").alias("event_kind"),
+                pl.col("action_type").cast(pl.String).alias("action_kind"),
+            ])
+        )
+
+        union_events = (
+            pl.concat([search_events, action_events], how="vertical")
+            .sort(["user_id", "timestamp"])
+            .with_columns([
+                pl.when(pl.col("event_kind") == "search")
+                .then(pl.col("timestamp"))
+                .otherwise(None)
+                .alias("search_ts_raw")
+            ])
+            .with_columns([
+                pl.col("search_ts_raw").forward_fill().over(
+                    "user_id").alias("last_search_ts")
+            ])
+            .with_columns([
+                (pl.col("timestamp") - pl.col("last_search_ts")
+                 ).dt.total_seconds().alias("secs_since_last_search")
+            ])
+        )
+
+        action_after_search = (
+            union_events
+            .filter(pl.col("event_kind") == "action")
+            .filter(pl.col("last_search_ts").is_not_null())
+            .filter(pl.col("secs_since_last_search") >= 0)
+            .with_columns([
+                (pl.col("secs_since_last_search") <= 300).cast(
+                    pl.Int8).alias("within_5m"),
+                (pl.col("secs_since_last_search") <= 1800).cast(
+                    pl.Int8).alias("within_30m"),
+                (pl.col("secs_since_last_search") <= 3600).cast(
+                    pl.Int8).alias("within_60m"),
+            ])
+        )
+
+        search_counts = search_events.group_by("user_id").agg([
+            pl.len().alias("search_events_30d")
+        ])
+
+        conv = action_after_search.group_by("user_id").agg([
+            ((pl.col("action_kind") == "click") & (pl.col("within_5m") == 1)
+             ).sum().alias("search_to_click_5m_count"),
+            ((pl.col("action_kind") == "click") & (pl.col("within_30m") == 1)
+             ).sum().alias("search_to_click_30m_count"),
+            ((pl.col("action_kind") == "click") & (pl.col("within_60m") == 1)
+             ).sum().alias("search_to_click_60m_count"),
+
+            ((pl.col("action_kind") == "to_cart") & (pl.col("within_5m") == 1)
+             ).sum().alias("search_to_cart_5m_count"),
+            ((pl.col("action_kind") == "to_cart") & (pl.col("within_30m") == 1)
+             ).sum().alias("search_to_cart_30m_count"),
+            ((pl.col("action_kind") == "to_cart") & (pl.col("within_60m") == 1)
+             ).sum().alias("search_to_cart_60m_count"),
+
+            pl.col("secs_since_last_search").filter(pl.col("action_kind")
+                                                    == "click").mean().alias("mean_secs_search_to_click"),
+            pl.col("secs_since_last_search").filter(pl.col("action_kind")
+                                                    == "to_cart").mean().alias("mean_secs_search_to_cart"),
+        ])
+
+        return (
+            search_counts
+            .join(conv, on="user_id", how="full", coalesce=True)
+            .with_columns([
+                ((pl.col("search_to_click_30m_count") + 1) /
+                 (pl.col("search_events_30d") + 1)).alias("search_to_click_30m_rate"),
+                ((pl.col("search_to_cart_30m_count") + 1) /
+                 (pl.col("search_events_30d") + 1)).alias("search_to_cart_30m_rate"),
+            ])
+        )
+
+    def _get_repeat_loyalty_features(self, feature_end_date: date) -> pl.LazyFrame:
+        actions_df = (
+            self.actions_history
+            .filter(pl.col("timestamp").dt.date() <= feature_end_date)
+            .filter(pl.col("timestamp").dt.date() >= feature_end_date - timedelta(days=120))
+            .filter(pl.col("product_id").is_not_null())
+            .join(
+                self.product_information.select(
+                    ["product_id", "brand", "category_id"]),
+                on="product_id",
+                how="left",
+            )
+            .select(["user_id", "product_id", "brand", "category_id", "action_type"])
+        )
+
+        product_counts = (
+            actions_df
+            .group_by(["user_id", "product_id"])
+            .agg(pl.len().alias("product_cnt"))
+        )
+
+        product_loyalty = product_counts.group_by("user_id").agg([
+            pl.len().alias("unique_products_120d"),
+            pl.col("product_cnt").sum().alias("total_product_events_120d"),
+            (pl.col("product_cnt") > 1).sum().alias("repeat_products_120d"),
+            pl.col("product_cnt").max().alias("favorite_product_cnt"),
+        ]).with_columns([
+            (pl.col("repeat_products_120d") /
+             (pl.col("unique_products_120d") + 1)).alias("repeat_product_rate"),
+            (pl.col("favorite_product_cnt") / pl.col("total_product_events_120d")
+             ).alias("favorite_product_share"),
+        ])
+
+        category_counts = (
+            actions_df
+            .filter(pl.col("category_id").is_not_null())
+            .group_by(["user_id", "category_id"])
+            .agg(pl.len().alias("category_cnt"))
+        )
+
+        category_loyalty = category_counts.group_by("user_id").agg([
+            pl.len().alias("unique_categories_120d"),
+            pl.col("category_cnt").sum().alias("total_category_events_120d"),
+            (pl.col("category_cnt") > 1).sum().alias("repeat_categories_120d"),
+            pl.col("category_cnt").max().alias("favorite_category_cnt_120d"),
+        ]).with_columns([
+            (pl.col("repeat_categories_120d") /
+             (pl.col("unique_categories_120d") + 1)).alias("repeat_category_rate"),
+            (pl.col("favorite_category_cnt_120d") / pl.col("total_category_events_120d")
+             ).alias("favorite_category_share_120d"),
+        ])
+
+        brand_counts = (
+            actions_df
+            .filter(pl.col("brand").is_not_null() & (pl.col("brand") != ""))
+            .group_by(["user_id", "brand"])
+            .agg(pl.len().alias("brand_cnt"))
+        )
+
+        brand_loyalty = brand_counts.group_by("user_id").agg([
+            pl.len().alias("unique_brands_120d"),
+            pl.col("brand_cnt").sum().alias("total_brand_events_120d"),
+            (pl.col("brand_cnt") > 1).sum().alias("repeat_brands_120d"),
+            pl.col("brand_cnt").max().alias("favorite_brand_cnt"),
+        ]).with_columns([
+            (pl.col("repeat_brands_120d") /
+             (pl.col("unique_brands_120d") + 1)).alias("repeat_brand_rate"),
+            (pl.col("favorite_brand_cnt") / pl.col("total_brand_events_120d")
+             ).alias("favorite_brand_share"),
+        ])
+
+        per_action = (
+            actions_df
+            .group_by(["user_id", "action_type"])
+            .agg([
+                pl.col("product_id").n_unique().alias(
+                    "unique_products_by_action"),
+                pl.len().alias("events_by_action"),
+            ])
+            .with_columns([
+                ((pl.col("events_by_action") - pl.col("unique_products_by_action")
+                  ) / (pl.col("events_by_action") + 1))
+                .alias("repeat_share_by_action")
+            ])
+            .collect(engine="streaming")
+            .pivot(
+                values="repeat_share_by_action",
+                index="user_id",
+                on="action_type",
+                aggregate_function="first",
+            )
+            .fill_null(0)
+        )
+
+        per_action = per_action.rename({
+            c: f"repeat_share_action_{c}"
+            for c in per_action.columns if c != "user_id"
+        }).lazy()
+
+        return (
+            product_loyalty
+            .join(category_loyalty, on="user_id", how="full", coalesce=True)
+            .join(brand_loyalty, on="user_id", how="full", coalesce=True)
+            .join(per_action, on="user_id", how="full", coalesce=True)
+        )
+
+    def _get_widget_features(self, feature_end_date: date, top_k_widgets: int = 20) -> pl.LazyFrame:
+        actions_df = (
+            self.actions_history
+            .filter(pl.col("timestamp").dt.date() <= feature_end_date)
+            .filter(pl.col("timestamp").dt.date() >= feature_end_date - timedelta(days=30))
+            .select(["user_id", "widget_name_id", "timestamp", "action_type"])
+        )
+
+        basic = actions_df.group_by("user_id").agg([
+            pl.len().alias("widget_events_30d"),
+            pl.col("widget_name_id").n_unique().alias("unique_widgets_30d"),
+            pl.col("widget_name_id").drop_nulls().mode(
+            ).first().alias("favorite_widget_name_id"),
+            pl.col("widget_name_id").drop_nulls(
+            ).last().alias("last_widget_name_id"),
+        ])
+
+        widget_counts = (
+            actions_df
+            .filter(pl.col("widget_name_id").is_not_null())
+            .group_by(["user_id", "widget_name_id"])
+            .agg(pl.len().alias("widget_cnt"))
+        )
+
+        widget_totals = widget_counts.group_by("user_id").agg([
+            pl.col("widget_cnt").sum().alias("total_widget_cnt"),
+            pl.col("widget_cnt").max().alias("favorite_widget_cnt"),
+        ]).with_columns([
+            (pl.col("favorite_widget_cnt") /
+             pl.col("total_widget_cnt")).alias("favorite_widget_share")
+        ])
+
+        widget_entropy = (
+            widget_counts
+            .join(widget_totals.select(["user_id", "total_widget_cnt"]), on="user_id", how="left")
+            .with_columns([
+                (pl.col("widget_cnt") / pl.col("total_widget_cnt")).alias("p_widget")
+            ])
+            .with_columns([
+                pl.when(pl.col("p_widget") > 0)
+                .then(-pl.col("p_widget") * pl.col("p_widget").log())
+                .otherwise(0.0)
+                .alias("entropy_term")
+            ])
+            .group_by("user_id")
+            .agg(pl.col("entropy_term").sum().alias("widget_entropy"))
+        )
+
+        top_widgets = (
+            actions_df
+            .filter(pl.col("widget_name_id").is_not_null())
+            .group_by("widget_name_id")
+            .agg(pl.len().alias("global_widget_cnt"))
+            .sort("global_widget_cnt", descending=True)
+            .head(top_k_widgets)
+            .collect(engine="streaming")
+        )
+
+        top_widget_ids = top_widgets["widget_name_id"].to_list()
+
+        widget_top_shares_df = (
+            widget_counts
+            .filter(pl.col("widget_name_id").is_in(top_widget_ids))
+            .join(widget_totals.select(["user_id", "total_widget_cnt"]), on="user_id", how="left")
+            .with_columns([
+                (pl.col("widget_cnt") / pl.col("total_widget_cnt")).alias("share")
+            ])
+            .collect(engine="streaming")
+            .pivot(
+                values="share",
+                index="user_id",
+                on="widget_name_id",
+                aggregate_function="first",
+            )
+            .fill_null(0)
+        )
+
+        widget_top_shares = widget_top_shares_df.rename({
+            c: f"top_widget_share_{c}"
+            for c in widget_top_shares_df.columns if c != "user_id"
+        }).lazy()
+
+        return (
+            basic
+            .join(widget_totals, on="user_id", how="full", coalesce=True)
+            .join(widget_entropy, on="user_id", how="full", coalesce=True)
+            .join(widget_top_shares, on="user_id", how="full", coalesce=True)
+        )
+
     def construct_dataset(
         self,
         feature_end_date: date,
@@ -774,7 +1175,11 @@ class OzonDataFormer:
         include_actions: bool = False,
         include_search: bool = False,
         include_price: bool = False,
-        group_embedding_features: bool = False
+        include_trend: bool = False,
+        include_action_conversion: bool = False,
+        include_repeat_loyalty: bool = False,
+        include_widget: bool = False,
+        group_embedding: bool = False
     ) -> pl.DataFrame:
         if target_start_date is not None and target_end_date is not None:
             df = self._make_target(target_start_date, target_end_date)
@@ -806,13 +1211,33 @@ class OzonDataFormer:
                 self._get_price_features(feature_end_date), on="user_id", how="left"
             )
 
+        if include_trend:
+            df = df.join(
+                self._get_trend_features(feature_end_date), on="user_id", how="left"
+            )
+
+        if include_action_conversion:
+            df = df.join(
+                self._get_search_action_conversion_features(feature_end_date), on="user_id", how="left"
+            )
+
+        if include_repeat_loyalty:
+            df = df.join(
+                self._get_repeat_loyalty_features(feature_end_date), on="user_id", how="left"
+            )
+
+        if include_widget:
+            df = df.join(
+                self._get_widget_features(feature_end_date), on="user_id", how="left"
+            )
+
         df = df.with_columns(
             cs.numeric().fill_null(strategy="zero"),
             cs.string().fill_null(""),
             cs.categorical().fill_null("NONE"),
         )
 
-        if group_embedding_features:
+        if group_embedding:
             df = df.with_columns(
                 pl.concat_list([f"search_tfidf_svd_{i:02d}"
                                 for i in range(N_SVD_COMPONENTS)]).alias('search_emb')

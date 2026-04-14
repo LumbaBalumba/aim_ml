@@ -61,6 +61,16 @@ class ShapBeeswarmResult:
     fig: plt.Figure
 
 
+@dataclass
+class ShapInteractionHeatmapResult:
+    explainer: object
+    interaction_values: np.ndarray
+    mean_abs_interactions: np.ndarray
+    feature_names: list[str]
+    fig: plt.Figure
+    ax: plt.Axes
+
+
 class BinaryClassifierInterpreter:
     def __init__(
         self,
@@ -1098,6 +1108,110 @@ class BinaryClassifierInterpreter:
         dropdown.observe(_on_change, names="value")
         return widgets.VBox([dropdown, fig])
 
+    @staticmethod
+    def _is_catboost_model(model) -> bool:
+        class_name = model.__class__.__name__.lower()
+        module_name = model.__class__.__module__.lower()
+        return "catboost" in class_name or "catboost" in module_name
+
+    @staticmethod
+    def _get_feature_names_for_shap(X) -> list[str]:
+        if hasattr(X, "columns"):
+            return [str(c) for c in X.columns]
+        X_arr = np.asarray(X)
+        if X_arr.ndim != 2:
+            raise ValueError(f"X must be 2D, got shape={X_arr.shape}")
+        return [f"feature_{i}" for i in range(X_arr.shape[1])]
+
+    @staticmethod
+    def _sample_rows(X, k: int, random_state: int):
+        n = len(X)
+        if k >= n:
+            return X
+
+        rng = np.random.default_rng(random_state)
+        idx = rng.choice(n, size=k, replace=False)
+
+        if hasattr(X, "iloc"):
+            return X.iloc[idx]
+        return np.asarray(X)[idx]
+
+    def _resolve_shap_sample(self, X, sample_frac, sample_size, random_state):
+        if sample_frac is not None and sample_size is not None:
+            raise ValueError("Specify only one of sample_frac or sample_size")
+
+        n = len(X)
+        if sample_frac is not None:
+            if not (0 < sample_frac <= 1):
+                raise ValueError("sample_frac must be in (0, 1]")
+            k = max(1, int(round(n * sample_frac)))
+        elif sample_size is not None:
+            if sample_size <= 0:
+                raise ValueError("sample_size must be positive")
+            k = min(int(sample_size), n)
+        else:
+            k = n
+
+        return self._sample_rows(X, k=k, random_state=random_state)
+
+    def _make_shap_explainer(self):
+        """
+        Build a SHAP explainer compatible with the fitted model.
+
+        Important:
+        - For CatBoost with categorical splits, do NOT pass background data.
+        - Use tree_path_dependent perturbation so string categorical values are accepted.
+        """
+        if self._is_catboost_model(self.model):
+            return shap.TreeExplainer(
+                self.model,
+                feature_perturbation="tree_path_dependent",
+                model_output="raw",
+            )
+
+        return shap.Explainer(self.model)
+
+    @staticmethod
+    def _normalize_shap_values_for_binary(shap_values):
+        """
+        Normalize SHAP outputs to a 2D array of shape (n_samples, n_features).
+
+        Handles:
+        - Explanation.values already 2D
+        - Explanation.values 3D with trailing class axis
+        - list outputs from older SHAP APIs
+        """
+        values = shap_values
+
+        if isinstance(values, list):
+            if len(values) == 1:
+                values = np.asarray(values[0])
+            elif len(values) == 2:
+                values = np.asarray(values[1])
+            else:
+                raise ValueError(
+                    f"Unsupported SHAP list output with length={len(values)} for binary classification."
+                )
+
+        values = np.asarray(values)
+
+        if values.ndim == 2:
+            return values
+
+        if values.ndim == 3:
+            # common shape: (n_samples, n_features, n_outputs)
+            if values.shape[2] == 1:
+                return values[:, :, 0]
+            if values.shape[2] == 2:
+                return values[:, :, 1]
+            raise ValueError(
+                f"Unsupported 3D SHAP values shape {values.shape} for binary classification."
+            )
+
+        raise ValueError(
+            f"Unsupported SHAP values ndim={values.ndim}. Expected 2D or 3D."
+        )
+
     # ============================================================
     # SHAP
     # ============================================================
@@ -1112,38 +1226,26 @@ class BinaryClassifierInterpreter:
         sample_size: Optional[int] = None,
         random_state: int = 42,
     ) -> ShapBeeswarmResult:
-        if sample_frac is not None and sample_size is not None:
-            raise ValueError("Specify only one of sample_frac or sample_size")
+        X_used = self._resolve_shap_sample(
+            self.X_val,
+            sample_frac=sample_frac,
+            sample_size=sample_size,
+            random_state=random_state,
+        )
 
-        X_val = self.X_val
-        n = len(X_val)
+        explainer = self._make_shap_explainer()
 
-        if sample_frac is not None:
-            if not (0 < sample_frac <= 1):
-                raise ValueError("sample_frac must be in (0, 1]")
-            k = max(1, int(round(n * sample_frac)))
-        elif sample_size is not None:
-            if sample_size <= 0:
-                raise ValueError("sample_size must be positive")
-            k = min(int(sample_size), n)
-        else:
-            k = n
-
-        if k < n:
-            rng = np.random.default_rng(random_state)
-            idx = rng.choice(n, size=k, replace=False)
-            if hasattr(X_val, "iloc"):
-                X_used = X_val.iloc[idx]
-            else:
-                X_used = np.asarray(X_val)[idx]
-        else:
-            X_used = X_val
-
-        explainer = shap.Explainer(self.model, X_used)
+        # For CatBoost + categorical features this works because:
+        # - no background data is passed to TreeExplainer
+        # - feature_perturbation="tree_path_dependent"
         explanation = explainer(X_used)
 
         fig = plt.figure(figsize=figsize)
-        shap.plots.beeswarm(explanation, max_display=max_display, show=False)
+        shap.plots.beeswarm(
+            explanation,
+            max_display=max_display,
+            show=False,
+        )
 
         if title is not None:
             plt.title(title)
@@ -1152,6 +1254,139 @@ class BinaryClassifierInterpreter:
             explainer=explainer,
             explanation=explanation,
             fig=fig,
+        )
+
+    def plot_shap_interaction_heatmap(
+        self,
+        *,
+        max_display: int = 20,
+        figsize: Tuple[float, float] = (11.0, 9.0),
+        title: Optional[str] = None,
+        sample_frac: Optional[float] = None,
+        sample_size: Optional[int] = 1000,
+        random_state: int = 42,
+        sort_by_strength: bool = True,
+        annotate: bool = False,
+    ) -> ShapInteractionHeatmapResult:
+        """
+        Plot mean absolute SHAP interaction strengths as a heatmap.
+
+        Notes
+        -----
+        - This uses TreeExplainer.shap_interaction_values, so it is intended for tree models.
+        - For CatBoost with categorical splits, TreeExplainer must be constructed without
+          background data and with feature_perturbation="tree_path_dependent".
+        - Interaction computation can be expensive; default sample_size is capped.
+        """
+        X_used = self._resolve_shap_sample(
+            self.X_val,
+            sample_frac=sample_frac,
+            sample_size=sample_size,
+            random_state=random_state,
+        )
+
+        explainer = self._make_shap_explainer()
+
+        try:
+            interaction_values = explainer.shap_interaction_values(X_used)
+        except Exception as e:
+            raise RuntimeError(
+                "Failed to compute SHAP interaction values for this model/input. "
+                "For CatBoost, make sure the model is tree-based and the input format "
+                "matches the model training format."
+            ) from e
+
+        interaction_values = np.asarray(interaction_values)
+
+        # Normalize possible binary-class outputs:
+        # - (n_samples, n_features, n_features)
+        # - (2, n_samples, n_features, n_features)
+        # - list length 2 in older SHAP
+        if isinstance(interaction_values, list):
+            if len(interaction_values) == 1:
+                interaction_values = np.asarray(interaction_values[0])
+            elif len(interaction_values) == 2:
+                interaction_values = np.asarray(interaction_values[1])
+            else:
+                raise ValueError(
+                    f"Unsupported interaction output list length={len(interaction_values)}."
+                )
+
+        if interaction_values.ndim == 4:
+            # assume leading axis is class/output axis
+            if interaction_values.shape[0] == 1:
+                interaction_values = interaction_values[0]
+            elif interaction_values.shape[0] == 2:
+                interaction_values = interaction_values[1]
+            else:
+                raise ValueError(
+                    f"Unsupported 4D interaction tensor shape={interaction_values.shape}."
+                )
+
+        if interaction_values.ndim != 3:
+            raise ValueError(
+                f"Expected interaction tensor of shape (n_samples, n_features, n_features), "
+                f"got shape={interaction_values.shape}."
+            )
+
+        mean_abs_interactions = np.mean(np.abs(interaction_values), axis=0)
+
+        feature_names = self._get_feature_names_for_shap(X_used)
+
+        if mean_abs_interactions.shape[0] != len(feature_names):
+            raise ValueError(
+                "Mismatch between interaction matrix size and number of feature names: "
+                f"{mean_abs_interactions.shape[0]} vs {len(feature_names)}."
+            )
+
+        if sort_by_strength:
+            strength = mean_abs_interactions.sum(axis=1)
+            order = np.argsort(-strength)
+        else:
+            order = np.arange(len(feature_names))
+
+        if max_display is not None and max_display > 0:
+            order = order[: min(max_display, len(order))]
+
+        heatmap = mean_abs_interactions[np.ix_(order, order)]
+        shown_feature_names = [feature_names[i] for i in order]
+
+        fig, ax = plt.subplots(figsize=figsize)
+        im = ax.imshow(heatmap, aspect="auto")
+        cbar = plt.colorbar(im, ax=ax)
+        cbar.set_label("mean(|SHAP interaction|)")
+
+        ax.set_xticks(np.arange(len(shown_feature_names)))
+        ax.set_yticks(np.arange(len(shown_feature_names)))
+        ax.set_xticklabels(shown_feature_names, rotation=90)
+        ax.set_yticklabels(shown_feature_names)
+
+        if annotate:
+            for i in range(heatmap.shape[0]):
+                for j in range(heatmap.shape[1]):
+                    ax.text(
+                        j,
+                        i,
+                        f"{heatmap[i, j]:.3g}",
+                        ha="center",
+                        va="center",
+                        fontsize=8,
+                    )
+
+        if title is None:
+            title = "SHAP feature interaction heatmap"
+        ax.set_title(title)
+        ax.set_xlabel("feature")
+        ax.set_ylabel("feature")
+        fig.tight_layout()
+
+        return ShapInteractionHeatmapResult(
+            explainer=explainer,
+            interaction_values=interaction_values,
+            mean_abs_interactions=mean_abs_interactions,
+            feature_names=feature_names,
+            fig=fig,
+            ax=ax,
         )
 
 
