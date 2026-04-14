@@ -7,6 +7,8 @@ import numpy as np
 import pandas as pd
 import panel as pn
 import umap
+import shap
+import matplotlib.pyplot as plt
 
 from bokeh.layouts import column as bk_column
 from bokeh.layouts import row as bk_row
@@ -53,6 +55,8 @@ class ClusterComparisonResult:
     fitted_model: CatBoostClassifier
     cluster_1_label_distribution: Dict[Any, float]
     cluster_2_label_distribution: Dict[Any, float]
+    shap_values: Optional[np.ndarray] = None
+    shap_feature_order: Optional[np.ndarray] = None
 
 
 class NotebookBinaryClusterInterpreter:
@@ -239,6 +243,12 @@ class NotebookBinaryClusterInterpreter:
             text=self._cluster_summary_html(), width=350, height=220)
         self.metrics_div = Div(
             text=self._default_metrics_html(), width=400, height=180)
+        self.shap_pane = pn.pane.Matplotlib(
+            None,
+            width=1040,
+            height=420,
+            tight=True,
+        )
 
     def _build_figures(self) -> None:
         self.scatter_fig = figure(
@@ -542,6 +552,63 @@ class NotebookBinaryClusterInterpreter:
             parts.append(f"class {label}: {pct:.2f}%")
         return "<br>".join(parts)
 
+    @staticmethod
+    def _compute_shap_importance_order(shap_values: np.ndarray) -> np.ndarray:
+        """
+        Order features by max absolute SHAP value across objects.
+        """
+        shap_values = np.asarray(shap_values)
+        if shap_values.ndim != 2:
+            raise ValueError(f"shap_values must be 2D, got shape={shap_values.shape}")
+        return np.argsort(np.max(np.abs(shap_values), axis=0))[::-1]
+
+    def _build_shap_beeswarm_figure(
+        self,
+        model: CatBoostClassifier,
+        X_explain: np.ndarray,
+        *,
+        max_samples: int = 2000,
+        max_display: int = 20,
+        random_state: int = 42,
+    ):
+        if len(X_explain) == 0:
+            return None, None, None
+
+        if len(X_explain) > max_samples:
+            rng = np.random.default_rng(random_state)
+            idx = rng.choice(len(X_explain), size=max_samples, replace=False)
+            X_used = X_explain[idx]
+        else:
+            X_used = X_explain
+
+        explainer = shap.TreeExplainer(model)
+        shap_values = explainer.shap_values(X_used)
+
+        if isinstance(shap_values, list):
+            if len(shap_values) == 0:
+                return None, None, None
+            shap_values = shap_values[-1]
+
+        shap_values = np.asarray(shap_values)
+        if shap_values.ndim == 3:
+            shap_values = shap_values[..., -1]
+        if shap_values.ndim != 2:
+            return None, None, None
+
+        feature_order = self._compute_shap_importance_order(shap_values)
+
+        fig = plt.figure(figsize=(13, 4.6))
+        shap.summary_plot(
+            shap_values[:, feature_order],
+            X_used[:, feature_order],
+            feature_names=[self.feature_names[i] for i in feature_order],
+            max_display=min(max_display, len(feature_order)),
+            show=False,
+            sort=False,
+        )
+        plt.title("SHAP beeswarm for cluster separation")
+        return fig, shap_values, feature_order
+
     def _on_compare_clusters(self) -> None:
         cluster_a = self.cluster_a_select.value
         cluster_b = self.cluster_b_select.value
@@ -600,6 +667,21 @@ class NotebookBinaryClusterInterpreter:
             random_seed=42,
         )
         model.fit(X_train, y_train)
+
+        shap_fig = None
+        shap_values = None
+        shap_feature_order = None
+        try:
+            shap_fig, shap_values, shap_feature_order = self._build_shap_beeswarm_figure(
+                model,
+                X_test,
+                max_samples=2000,
+                max_display=min(20, self.n_features),
+                random_state=42,
+            )
+            self.shap_pane.object = shap_fig
+        except Exception:
+            self.shap_pane.object = None
 
         scores_test = self._raw_scores_catboost(model, X_test)
         best_threshold, thresholds, f1_values = self._find_best_threshold(
@@ -684,6 +766,8 @@ class NotebookBinaryClusterInterpreter:
             fitted_model=model,
             cluster_1_label_distribution=cluster_a_label_distribution,
             cluster_2_label_distribution=cluster_b_label_distribution,
+            shap_values=shap_values,
+            shap_feature_order=shap_feature_order,
         )
 
     # ============================================================
@@ -732,6 +816,7 @@ class NotebookBinaryClusterInterpreter:
                     pn.pane.Bokeh(self.hist_right_fig),
                 ),
             ),
+            self.shap_pane,
             sizing_mode="stretch_width",
         )
 
