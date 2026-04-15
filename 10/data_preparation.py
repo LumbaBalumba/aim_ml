@@ -744,7 +744,7 @@ class OzonDataFormer:
                 on="category_id",
                 aggregate_function="first",
             )
-            .fill_null(0)
+            # .fill_null(0)
         )
 
         rename_map = {
@@ -1062,7 +1062,7 @@ class OzonDataFormer:
                 on="action_type",
                 aggregate_function="first",
             )
-            .fill_null(0)
+            # .fill_null(0)
         )
 
         per_action = per_action.rename({
@@ -1151,7 +1151,7 @@ class OzonDataFormer:
                 on="widget_name_id",
                 aggregate_function="first",
             )
-            .fill_null(0)
+            # .fill_null(0)
         )
 
         widget_top_shares = widget_top_shares_df.rename({
@@ -1232,7 +1232,7 @@ class OzonDataFormer:
             )
 
         df = df.with_columns(
-            cs.numeric().fill_null(strategy="zero"),
+            # cs.numeric().fill_null(strategy="zero"),
             cs.string().fill_null(""),
             cs.categorical().fill_null("NONE"),
         )

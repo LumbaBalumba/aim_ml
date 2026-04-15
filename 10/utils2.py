@@ -22,6 +22,8 @@ from sklearn.metrics import (
     recall_score,
     matthews_corrcoef,
 )
+from sklearn.metrics import roc_auc_score, average_precision_score, log_loss
+from sklearn.inspection import permutation_importance
 from sklearn.utils.validation import check_is_fitted
 import shap
 import scipy.stats
@@ -69,6 +71,23 @@ class ShapInteractionHeatmapResult:
     feature_names: list[str]
     fig: plt.Figure
     ax: plt.Axes
+
+
+@dataclass
+class FeatureAblationResult:
+    baseline_roc_auc: float
+    baseline_pr_auc: float
+    baseline_logloss: float
+    table: pd.DataFrame
+
+
+@dataclass
+class FeatureSelectionSuggestion:
+    constant_features: list[str]
+    duplicate_features: list[tuple[str, str]]
+    high_corr_drop_candidates: list[str]
+    low_importance_features: list[str]
+    harmful_features_by_ablation: list[str]
 
 
 class BinaryClassifierInterpreter:
@@ -466,6 +485,87 @@ class BinaryClassifierInterpreter:
         n_bins = int(np.clip(n_bins, min_bins, max_bins))
         edges = np.linspace(lo, hi, n_bins + 1)
         return n_bins, edges
+
+    @staticmethod
+    def _predict_proba_binary(model, X) -> np.ndarray:
+        if hasattr(model, "predict_proba"):
+            proba = np.asarray(model.predict_proba(X))
+            if proba.ndim != 2 or proba.shape[1] < 2:
+                raise ValueError(f"predict_proba returned shape={proba.shape}")
+            return proba[:, 1]
+
+        if hasattr(model, "decision_function"):
+            scores = np.asarray(model.decision_function(X)).ravel()
+            return 1.0 / (1.0 + np.exp(-scores))
+
+        class_name = model.__class__.__name__.lower()
+        module_name = model.__class__.__module__.lower()
+
+        if "catboost" in module_name or "catboost" in class_name:
+            raw = np.asarray(model.predict(X, prediction_type="Probability"))
+            if raw.ndim == 2 and raw.shape[1] >= 2:
+                return raw[:, 1]
+            return np.ravel(raw).astype(float)
+
+        raise TypeError(
+            "Model must support predict_proba or decision_function.")
+
+    @staticmethod
+    def _ensure_dataframe(X, prefix: str = "feature") -> pd.DataFrame:
+        if isinstance(X, pd.DataFrame):
+            return X.copy()
+        X_arr = np.asarray(X)
+        if X_arr.ndim != 2:
+            raise ValueError(f"X must be 2D, got shape={X_arr.shape}")
+        cols = [f"{prefix}_{i}" for i in range(X_arr.shape[1])]
+        return pd.DataFrame(X_arr, columns=cols)
+
+    @staticmethod
+    def _is_numeric_series(s: pd.Series) -> bool:
+        return pd.api.types.is_numeric_dtype(s)
+
+    def _evaluate_current_model_on_features(
+        self,
+        X_train: pd.DataFrame,
+        X_val: pd.DataFrame,
+        y_train: np.ndarray,
+        y_val: np.ndarray,
+    ) -> tuple[object, float, float, float]:
+        model = self._safe_clone_model(self.model)
+        if self._is_model_fitted(model):
+            model = self._safe_clone_model(self.model)
+
+        model = self._fit_model_on_train(
+            model,
+            X_train,
+            y_train,
+            X_val=X_val,
+            y_val=y_val,
+            enable_early_stopping=False,
+        )
+
+        val_pred = self._predict_proba_binary(model, X_val)
+        roc = roc_auc_score(y_val, val_pred)
+        pr = average_precision_score(y_val, val_pred)
+        ll = log_loss(y_val, val_pred, labels=[0, 1])
+        return model, roc, pr, ll
+
+    @staticmethod
+    def _normalize_importance_series(
+        importance_values: np.ndarray,
+        feature_names: list[str],
+        name: str,
+    ) -> pd.DataFrame:
+        imp = np.asarray(importance_values).ravel()
+        if len(imp) != len(feature_names):
+            raise ValueError(
+                f"Importance length mismatch: len(values)={len(imp)} vs len(features)={len(feature_names)}"
+            )
+        return (
+            pd.DataFrame({"feature": feature_names, name: imp})
+            .sort_values(name, ascending=False)
+            .reset_index(drop=True)
+        )
 
     # ============================================================
     # Score histogram with validation metric
@@ -1388,6 +1488,332 @@ class BinaryClassifierInterpreter:
             fig=fig,
             ax=ax,
         )
+
+    def find_constant_features(
+        self,
+        *,
+        split: str = "train",
+        min_unique: int = 1,
+        include_nan_as_value: bool = True,
+    ) -> list[str]:
+        X = self.X_train if split == "train" else self.X_val
+        X_df = self._ensure_dataframe(X)
+
+        constant_cols = []
+        for col in X_df.columns:
+            nunique = X_df[col].nunique(dropna=not include_nan_as_value)
+            if nunique <= min_unique:
+                constant_cols.append(col)
+        return constant_cols
+
+    def find_duplicate_features(
+        self,
+        *,
+        split: str = "train",
+    ) -> list[tuple[str, str]]:
+        X = self.X_train if split == "train" else self.X_val
+        X_df = self._ensure_dataframe(X)
+
+        hashes: dict[str, str] = {}
+        duplicates: list[tuple[str, str]] = []
+
+        for col in X_df.columns:
+            h = pd.util.hash_pandas_object(X_df[col], index=False).sum()
+            key = str(h)
+            if key in hashes:
+                other = hashes[key]
+                if X_df[col].equals(X_df[other]):
+                    duplicates.append((other, col))
+            else:
+                hashes[key] = col
+
+        return duplicates
+
+    def find_high_corr_features(
+        self,
+        *,
+        split: str = "train",
+        threshold: float = 0.995,
+        method: str = "spearman",
+    ) -> list[str]:
+        X = self.X_train if split == "train" else self.X_val
+        X_df = self._ensure_dataframe(X)
+
+        num_df = X_df.select_dtypes(include=[np.number]).copy()
+        if num_df.shape[1] == 0:
+            return []
+
+        corr = num_df.corr(method=method).abs()
+        upper = corr.where(np.triu(np.ones(corr.shape), k=1).astype(bool))
+
+        to_drop = [
+            col for col in upper.columns
+            if (upper[col] >= threshold).any()
+        ]
+        return to_drop
+
+    def get_model_feature_importance(
+        self,
+        *,
+        refit: bool = True,
+    ) -> pd.DataFrame:
+        X_train = self._ensure_dataframe(self.X_train)
+        X_val = self._ensure_dataframe(self.X_val)
+
+        if refit:
+            model, _, _, _ = self._evaluate_current_model_on_features(
+                X_train, X_val, self.y_train, self.y_val
+            )
+        else:
+            model = self.model
+
+        feature_names = list(X_train.columns)
+
+        if hasattr(model, "feature_importances_"):
+            imp = np.asarray(model.feature_importances_)
+        elif hasattr(model, "get_feature_importance"):
+            imp = np.asarray(model.get_feature_importance())
+        else:
+            raise TypeError(
+                "Model does not expose built-in feature importances.")
+
+        return self._normalize_importance_series(imp, feature_names, "model_importance")
+
+    def get_permutation_importance(
+        self,
+        *,
+        n_repeats: int = 5,
+        random_state: int = 42,
+        scoring: str = "roc_auc",
+        refit: bool = True,
+    ) -> pd.DataFrame:
+        X_train = self._ensure_dataframe(self.X_train)
+        X_val = self._ensure_dataframe(self.X_val)
+
+        if refit:
+            model, _, _, _ = self._evaluate_current_model_on_features(
+                X_train, X_val, self.y_train, self.y_val
+            )
+        else:
+            model = self.model
+
+        result = permutation_importance(
+            model,
+            X_val,
+            self.y_val,
+            scoring=scoring,
+            n_repeats=n_repeats,
+            random_state=random_state,
+            n_jobs=-1,
+        )
+
+        return (
+            pd.DataFrame({
+                "feature": list(X_val.columns),
+                "perm_importance_mean": result.importances_mean,
+                "perm_importance_std": result.importances_std,
+            })
+            .sort_values("perm_importance_mean", ascending=False)
+            .reset_index(drop=True)
+        )
+
+    def analyze_feature_ablation(
+        self,
+        *,
+        features: Optional[Sequence[str]] = None,
+        max_features: Optional[int] = None,
+        sort_by: str = "delta_roc_auc",
+    ) -> FeatureAblationResult:
+        X_train = self._ensure_dataframe(self.X_train)
+        X_val = self._ensure_dataframe(self.X_val)
+
+        _, baseline_roc, baseline_pr, baseline_ll = self._evaluate_current_model_on_features(
+            X_train, X_val, self.y_train, self.y_val
+        )
+
+        if features is None:
+            features = list(X_train.columns)
+        else:
+            features = [f for f in features if f in X_train.columns]
+
+        if max_features is not None:
+            features = list(features)[:max_features]
+
+        rows = []
+        all_cols = list(X_train.columns)
+
+        for feature in features:
+            kept = [c for c in all_cols if c != feature]
+            if len(kept) == 0:
+                continue
+
+            _, roc, pr, ll = self._evaluate_current_model_on_features(
+                X_train[kept], X_val[kept], self.y_train, self.y_val
+            )
+
+            rows.append({
+                "feature": feature,
+                "roc_auc": roc,
+                "pr_auc": pr,
+                "logloss": ll,
+                "delta_roc_auc": roc - baseline_roc,
+                "delta_pr_auc": pr - baseline_pr,
+                "delta_logloss": ll - baseline_ll,
+            })
+
+        table = pd.DataFrame(rows).sort_values(
+            sort_by, ascending=False).reset_index(drop=True)
+
+        return FeatureAblationResult(
+            baseline_roc_auc=baseline_roc,
+            baseline_pr_auc=baseline_pr,
+            baseline_logloss=baseline_ll,
+            table=table,
+        )
+
+    def greedy_drop_harmful_features(
+        self,
+        *,
+        min_delta_roc_auc: float = 1e-4,
+        max_rounds: int = 20,
+        verbose: bool = True,
+    ) -> pd.DataFrame:
+        X_train = self._ensure_dataframe(self.X_train)
+        X_val = self._ensure_dataframe(self.X_val)
+
+        current_cols = list(X_train.columns)
+        history = []
+
+        _, current_roc, current_pr, current_ll = self._evaluate_current_model_on_features(
+            X_train[current_cols], X_val[current_cols], self.y_train, self.y_val
+        )
+
+        for round_idx in range(max_rounds):
+            best_feature = None
+            best_roc = current_roc
+            best_pr = current_pr
+            best_ll = current_ll
+            best_delta = 0.0
+
+            for feature in current_cols:
+                kept = [c for c in current_cols if c != feature]
+                if len(kept) == 0:
+                    continue
+
+                _, roc, pr, ll = self._evaluate_current_model_on_features(
+                    X_train[kept], X_val[kept], self.y_train, self.y_val
+                )
+                delta = roc - current_roc
+
+                if delta > best_delta:
+                    best_delta = delta
+                    best_feature = feature
+                    best_roc = roc
+                    best_pr = pr
+                    best_ll = ll
+
+            if best_feature is None or best_delta < min_delta_roc_auc:
+                break
+
+            current_cols.remove(best_feature)
+            history.append({
+                "round": round_idx + 1,
+                "dropped_feature": best_feature,
+                "roc_auc": best_roc,
+                "pr_auc": best_pr,
+                "logloss": best_ll,
+                "delta_roc_auc": best_delta,
+                "n_features_left": len(current_cols),
+            })
+
+            current_roc, current_pr, current_ll = best_roc, best_pr, best_ll
+
+            if verbose:
+                print(
+                    f"[round {round_idx + 1}] drop '{best_feature}' | "
+                    f"ROC AUC={best_roc:.6f} | Δ={best_delta:.6f} | features left={len(current_cols)}"
+                )
+
+        return pd.DataFrame(history)
+
+    def suggest_features_to_drop(
+        self,
+        *,
+        corr_threshold: float = 0.995,
+        perm_threshold: float = 0.0,
+        ablation_min_delta: float = 0.0,
+        n_perm_repeats: int = 5,
+        max_ablation_features: Optional[int] = 100,
+    ) -> FeatureSelectionSuggestion:
+        constant_features = self.find_constant_features(split="train")
+        duplicate_pairs = self.find_duplicate_features(split="train")
+        duplicate_features = [b for _, b in duplicate_pairs]
+        high_corr_drop_candidates = self.find_high_corr_features(
+            split="train",
+            threshold=corr_threshold,
+            method="spearman",
+        )
+
+        perm_df = self.get_permutation_importance(
+            n_repeats=n_perm_repeats,
+            scoring="roc_auc",
+            refit=True,
+        )
+        low_importance_features = (
+            perm_df.loc[perm_df["perm_importance_mean"]
+                        <= perm_threshold, "feature"]
+            .tolist()
+        )
+
+        candidate_features = list(dict.fromkeys(
+            low_importance_features + high_corr_drop_candidates + duplicate_features
+        ))
+
+        ablation_features = candidate_features
+        if max_ablation_features is not None:
+            ablation_features = ablation_features[:max_ablation_features]
+
+        ablation_res = self.analyze_feature_ablation(
+            features=ablation_features,
+            sort_by="delta_roc_auc",
+        )
+
+        harmful_features = (
+            ablation_res.table.loc[
+                ablation_res.table["delta_roc_auc"] >= ablation_min_delta,
+                "feature"
+            ]
+            .tolist()
+        )
+
+        return FeatureSelectionSuggestion(
+            constant_features=constant_features,
+            duplicate_features=duplicate_pairs,
+            high_corr_drop_candidates=high_corr_drop_candidates,
+            low_importance_features=low_importance_features,
+            harmful_features_by_ablation=harmful_features,
+        )
+
+    @staticmethod
+    def plot_feature_importance_table(
+        importance_df: pd.DataFrame,
+        *,
+        feature_col: str = "feature",
+        value_col: str = "model_importance",
+        top_n: int = 25,
+        figsize: Tuple[int, int] = (10, 8),
+        title: Optional[str] = None,
+    ) -> plt.Figure:
+        plot_df = importance_df.head(top_n).iloc[::-1]
+
+        fig, ax = plt.subplots(figsize=figsize)
+        ax.barh(plot_df[feature_col], plot_df[value_col])
+        ax.set_xlabel(value_col)
+        ax.set_ylabel(feature_col)
+        ax.set_title(title or f"Top {top_n} features by {value_col}")
+        ax.grid(True, alpha=0.25)
+        fig.tight_layout()
+        return fig
 
 
 @dataclass
