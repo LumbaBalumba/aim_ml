@@ -162,6 +162,105 @@ class BinaryClassifierInterpreter:
             return model
 
     @staticmethod
+    def _infer_catboost_feature_types(X) -> dict[str, list]:
+        """
+        Infer CatBoost special feature lists from pandas DataFrame.
+
+        Returns a dict with keys:
+        - cat_features
+        - text_features
+        - embedding_features
+
+        Uses column names for DataFrame input, which CatBoost supports.
+        """
+        result = {
+            "cat_features": [],
+            "text_features": [],
+            "embedding_features": [],
+        }
+
+        if not isinstance(X, pd.DataFrame):
+            return result
+
+        for col in X.columns:
+            s = X[col]
+            dtype_str = str(s.dtype).lower()
+
+            # categorical / object -> categorical feature
+            if pd.api.types.is_categorical_dtype(s) or pd.api.types.is_object_dtype(s):
+                # distinguish text vs ordinary categorical object
+                non_null = s.dropna()
+                if len(non_null) > 0:
+                    sample = non_null.iloc[0]
+                    if isinstance(sample, str):
+                        # heuristic:
+                        # long/free-form text -> text feature
+                        # short label-like strings -> categorical feature
+                        avg_len = non_null.astype(str).str.len().mean()
+                        nunique = non_null.nunique()
+                        if avg_len > 20 and nunique > 20:
+                            result["text_features"].append(col)
+                        else:
+                            result["cat_features"].append(col)
+                    else:
+                        result["cat_features"].append(col)
+                else:
+                    result["cat_features"].append(col)
+                continue
+
+            # list/array-like columns -> embedding feature
+            if dtype_str == "object":
+                non_null = s.dropna()
+                if len(non_null) > 0:
+                    sample = non_null.iloc[0]
+                    if isinstance(sample, (list, tuple, np.ndarray)):
+                        result["embedding_features"].append(col)
+
+        # remove overlaps just in case
+        text_set = set(result["text_features"])
+        emb_set = set(result["embedding_features"])
+
+        result["cat_features"] = [
+            c for c in result["cat_features"]
+            if c not in text_set and c not in emb_set
+        ]
+
+        return result
+
+    @classmethod
+    def _build_catboost_fit_kwargs(
+        cls,
+        X_train,
+        X_val=None,
+        y_val=None,
+        *,
+        enable_early_stopping: bool = False,
+        early_stopping_rounds: int = 100,
+        use_best_model: bool = True,
+    ) -> dict:
+        fit_kwargs = {}
+
+        feature_types = cls._infer_catboost_feature_types(X_train)
+
+        if feature_types["cat_features"]:
+            fit_kwargs["cat_features"] = feature_types["cat_features"]
+        if feature_types["text_features"]:
+            fit_kwargs["text_features"] = feature_types["text_features"]
+        if feature_types["embedding_features"]:
+            fit_kwargs["embedding_features"] = feature_types["embedding_features"]
+
+        # IMPORTANT:
+        # CatBoost cannot train with use_best_model=True without eval_set.
+        if enable_early_stopping and X_val is not None and y_val is not None:
+            fit_kwargs["eval_set"] = (X_val, y_val)
+            fit_kwargs["use_best_model"] = use_best_model
+            fit_kwargs["early_stopping_rounds"] = early_stopping_rounds
+        else:
+            fit_kwargs["use_best_model"] = False
+
+        return fit_kwargs
+
+    @staticmethod
     def _is_model_fitted(model) -> bool:
         class_name = model.__class__.__name__.lower()
         module_name = model.__class__.__module__.lower()
@@ -240,26 +339,34 @@ class BinaryClassifierInterpreter:
         class_name = fitted_model.__class__.__name__.lower()
         module_name = fitted_model.__class__.__module__.lower()
 
+        if "catboost" in module_name or "catboost" in class_name:
+            # make sure cloned model itself does not keep an incompatible setting
+            fitted_model = cls._set_model_param_if_supported(
+                fitted_model,
+                "use_best_model",
+                bool(use_best_model) if enable_early_stopping else False,
+            )
+
+            fit_kwargs = cls._build_catboost_fit_kwargs(
+                X_train,
+                X_val=X_val,
+                y_val=y_val,
+                enable_early_stopping=enable_early_stopping,
+                early_stopping_rounds=early_stopping_rounds,
+                use_best_model=use_best_model,
+            )
+
+            fitted_model.fit(X_train, y_train, **fit_kwargs)
+            return fitted_model
+
         if not enable_early_stopping:
             fitted_model.fit(X_train, y_train)
             return fitted_model
 
         if X_val is None or y_val is None:
             raise ValueError(
-                "Validation data must be provided when enable_early_stopping=True.")
-
-        if "catboost" in module_name or "catboost" in class_name:
-            fitted_model = cls._set_model_param_if_supported(
-                fitted_model, "use_best_model", use_best_model)
-            fit_kwargs = {}
-            if cls._supports_fit_kwarg(fitted_model, "eval_set"):
-                fit_kwargs["eval_set"] = (X_val, y_val)
-            if cls._supports_fit_kwarg(fitted_model, "early_stopping_rounds"):
-                fit_kwargs["early_stopping_rounds"] = early_stopping_rounds
-            elif cls._supports_fit_kwarg(fitted_model, "od_wait"):
-                fit_kwargs["od_wait"] = early_stopping_rounds
-            fitted_model.fit(X_train, y_train, **fit_kwargs)
-            return fitted_model
+                "Validation data must be provided when enable_early_stopping=True."
+            )
 
         if "xgboost" in module_name or "xgb" in class_name:
             fit_kwargs = {}
@@ -279,8 +386,12 @@ class BinaryClassifierInterpreter:
             callbacks = []
             try:
                 import lightgbm as lgb  # type: ignore
-                callbacks.append(lgb.early_stopping(
-                    stopping_rounds=early_stopping_rounds, verbose=False))
+                callbacks.append(
+                    lgb.early_stopping(
+                        stopping_rounds=early_stopping_rounds,
+                        verbose=False,
+                    )
+                )
             except Exception:
                 pass
             if callbacks and cls._supports_fit_kwarg(fitted_model, "callbacks"):
