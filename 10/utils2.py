@@ -27,6 +27,7 @@ from sklearn.inspection import permutation_importance
 from sklearn.utils.validation import check_is_fitted
 import shap
 import scipy.stats
+from tqdm import tqdm
 
 
 ArrayLike = Union[np.ndarray, Sequence[float]]
@@ -356,7 +357,7 @@ class BinaryClassifierInterpreter:
                 use_best_model=use_best_model,
             )
 
-            fitted_model.fit(X_train, y_train, **fit_kwargs)
+            fitted_model.fit(X_train, y_train, **fit_kwargs, verbose=False)
             return fitted_model
 
         if not enable_early_stopping:
@@ -1753,7 +1754,7 @@ class BinaryClassifierInterpreter:
         rows = []
         all_cols = list(X_train.columns)
 
-        for feature in features:
+        for feature in tqdm(features):
             kept = [c for c in all_cols if c != feature]
             if len(kept) == 0:
                 continue
