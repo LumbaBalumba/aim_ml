@@ -1955,6 +1955,7 @@ class AutoFeatureStandardizer(BaseEstimator, TransformerMixin):
         zero_threshold: float = 0.5,
         clip_quantile: float = 0.999,
         add_indicators: bool = True,
+        to_drop: list[str] = []
     ):
         self.skew_threshold = skew_threshold
         self.zero_threshold = zero_threshold
@@ -1963,6 +1964,7 @@ class AutoFeatureStandardizer(BaseEstimator, TransformerMixin):
 
         self.feature_stats_: Dict[str, FeatureStats] = {}
         self.transforms_: Dict[str, str] = {}
+        self.to_drop = to_drop
 
     def _analyze_feature(self, x: np.ndarray) -> FeatureStats:
         mask = ~np.isnan(x)
@@ -2038,4 +2040,8 @@ class AutoFeatureStandardizer(BaseEstimator, TransformerMixin):
             if self.add_indicators:
                 X_out[f"{col}_is_nan"] = np.isnan(x).astype(float)
 
-        return X_out.copy()
+        X_out = X_out.copy()
+
+        X_out.drop(columns=self.to_drop, inplace=True)
+
+        return X_out
