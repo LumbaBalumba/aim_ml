@@ -1656,13 +1656,26 @@ class BinaryClassifierInterpreter:
             return []
 
         corr = num_df.corr(method=method).abs()
-        upper = corr.where(np.triu(np.ones(corr.shape), k=1).astype(bool))
+        cols = list(corr.columns)
 
-        to_drop = [
-            col for col in upper.columns
-            if (upper[col] >= threshold).any()
-        ]
-        return to_drop
+        selected = []
+        covered = set()
+
+        for i, col_i in enumerate(cols):
+            if col_i in covered:
+                continue
+
+            correlated_group = {col_i}
+            for j in range(i + 1, len(cols)):
+                col_j = cols[j]
+                if corr.iloc[i, j] >= threshold:
+                    correlated_group.add(col_j)
+
+            if len(correlated_group) > 1:
+                selected.append(col_i)
+                covered.update(correlated_group)
+
+        return selected
 
     def get_model_feature_importance(
         self,
